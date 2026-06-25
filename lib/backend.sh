@@ -114,28 +114,48 @@ cc_backend_exec() {
 
   cbe__bin="$(resolve_backend_bin "$cbe__backend")" || return 127
 
+  # At this point "$@" holds the extra add-dir paths (the first four fixed args
+  # were shifted off). We must NOT string-join the prompt (it is large, multi-
+  # line, arbitrary): it stays a single positional parameter throughout. We
+  # rebuild argv using the positional parameters only - bash 3.2 safe, no arrays.
   case "$cbe__backend" in
     claude )
-      # "$BIN" -p PROMPT --allowedTools TOOLS --add-dir CWD [--add-dir D]... --output-format text
-      set -- "$cbe__bin" -p "$cbe__prompt" --allowedTools "$cbe__tools" --add-dir "$cbe__cwd"
-      # Append each extra add-dir. Caller passed them as positional args; we
-      # consumed the first four already, so re-read from the saved list below.
+      # Interleave "--add-dir <dir>" before each extra dir, preserving them as
+      # real positional params. Rotate the current "$@" (the extra dirs) into a
+      # new "$@" that is: <each dir prefixed by --add-dir>.
+      cbe__ndirs="$#"
+      cbe__i=0
+      while [ "$cbe__i" -lt "$cbe__ndirs" ]; do
+        cbe__d="$1"; shift
+        if [ -n "$cbe__d" ]; then
+          set -- "$@" --add-dir "$cbe__d"
+        fi
+        cbe__i=$(( cbe__i + 1 ))
+      done
+      unset cbe__ndirs cbe__i cbe__d
+      # Now "$@" = (--add-dir D1 --add-dir D2 ...). Prepend the fixed claude
+      # flags and run, with cwd as the primary --add-dir.
+      ( cd "$cbe__cwd" 2>/dev/null || { cc_err "cwd missing: $cbe__cwd"; exit 3; }
+        exec "$cbe__bin" -p "$cbe__prompt" \
+          --allowedTools "$cbe__tools" \
+          --add-dir "$cbe__cwd" \
+          ${@+"$@"} \
+          --output-format text
+      )
+      return $?
       ;;
     codex )
-      set -- "$cbe__bin" exec "$cbe__prompt" --cd "$cbe__cwd" --sandbox workspace-write --ask-for-approval never
+      ( cd "$cbe__cwd" 2>/dev/null || { cc_err "cwd missing: $cbe__cwd"; exit 3; }
+        exec "$cbe__bin" exec "$cbe__prompt" \
+          --cd "$cbe__cwd" \
+          --sandbox workspace-write \
+          --ask-for-approval never
+      )
+      return $?
       ;;
     * )
       cc_err "cc_backend_exec: unknown backend '$cbe__backend'"
       return 2
       ;;
   esac
-
-  # For claude we still need to weave in the extra --add-dir entries and the
-  # trailing --output-format text. We rebuild argv carefully to stay 3.2-safe
-  # (no arrays). The extra add-dirs were the args after the first four; but we
-  # already did `shift 4`, so they are the current "$@" only if we had NOT
-  # rebuilt argv. To handle both backends uniformly we instead reconstruct
-  # below using a saved copy.
-  cc_err "internal: cc_backend_exec reached unreachable path"
-  return 70
 }
