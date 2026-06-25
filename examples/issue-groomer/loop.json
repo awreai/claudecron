@@ -1,0 +1,10 @@
+{
+  "id": "issue-groomer",
+  "enabled": true,
+  "interval_minutes": 240,
+  "cwd": "/home/octocat/repos/hello-world",
+  "add_dirs": ["/home/octocat/repos/hello-world"],
+  "allowed_tools": "Bash,Read",
+  "prompt_file": "prompts/issue-groomer.md",
+  "backend": "claude"
+}

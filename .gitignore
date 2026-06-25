@@ -1,0 +1,16 @@
+# Build artifacts
+dist/
+*.tar.gz
+*.sha256
+
+# Local runtime data (claudecron writes under $CLAUDECRON_HOME, never the repo)
+state/
+logs/
+lock/
+*.lock
+
+# Editor / tooling
+.serena/
+.superpowers/
+.claude/
+.DS_Store

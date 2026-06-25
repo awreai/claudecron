@@ -1,0 +1,16 @@
+# Copyright (c) 2026 The claudecron authors
+# systemd user timer for claudecron ({{LABEL}}).
+# Fires the runner once per minute.
+[Unit]
+Description=claudecron per-minute tick ({{LABEL}})
+Documentation=https://github.com/octocat/hello-world
+
+[Timer]
+OnCalendar=*:0/1
+Persistent=true
+OnBootSec=2min
+AccuracySec=30s
+Unit=dev.claudecron.runner.service
+
+[Install]
+WantedBy=timers.target

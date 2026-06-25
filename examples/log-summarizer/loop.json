@@ -1,0 +1,10 @@
+{
+  "id": "log-summarizer",
+  "enabled": true,
+  "interval_minutes": 60,
+  "cwd": "/home/octocat/repos/hello-world",
+  "add_dirs": ["/home/octocat/repos/hello-world"],
+  "allowed_tools": "Read,Write",
+  "prompt_file": "prompts/log-summarizer.md",
+  "backend": "codex"
+}

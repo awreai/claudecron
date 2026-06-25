@@ -1,0 +1,10 @@
+{
+  "id": "dep-watch",
+  "enabled": true,
+  "interval_minutes": 720,
+  "cwd": "/home/octocat/repos/hello-world",
+  "add_dirs": ["/home/octocat/repos/hello-world"],
+  "allowed_tools": "Bash,Read,Write",
+  "prompt_file": "prompts/dep-watch.md",
+  "backend": "claude"
+}

@@ -1,0 +1,55 @@
+# Copyright (c) 2026 The claudecron authors
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: build + publish release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Assert VERSION matches tag
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME#v}"
+          file_ver="$(cat VERSION)"
+          echo "tag version : ${tag}"
+          echo "VERSION file: ${file_ver}"
+          if [ "${file_ver}" != "${tag}" ]; then
+            echo "ERROR: VERSION file (${file_ver}) does not match tag (${tag})" >&2
+            exit 1
+          fi
+
+      - name: Build tarball + checksum
+        id: build
+        run: |
+          set -eu
+          ver="${GITHUB_REF_NAME#v}"
+          tarball="claudecron-${ver}.tar.gz"
+          tar -czf "${tarball}" \
+            bin \
+            lib \
+            templates \
+            VERSION \
+            README.md \
+            LICENSE
+          sha256sum "${tarball}" > "${tarball}.sha256"
+          echo "tarball=${tarball}" >> "$GITHUB_OUTPUT"
+          echo "checksum=${tarball}.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: awreai/claudecron
+          files: |
+            ${{ steps.build.outputs.tarball }}
+            ${{ steps.build.outputs.checksum }}

@@ -1,0 +1,10 @@
+{
+  "id": "pr-babysitter",
+  "enabled": true,
+  "interval_minutes": 15,
+  "cwd": "/home/octocat/repos/hello-world",
+  "add_dirs": ["/home/octocat/repos/hello-world"],
+  "allowed_tools": "Bash,Read",
+  "prompt_file": "prompts/pr-babysitter.md",
+  "backend": "claude"
+}

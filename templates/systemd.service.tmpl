@@ -1,0 +1,17 @@
+# Copyright (c) 2026 The claudecron authors
+# systemd user service for claudecron ({{LABEL}}).
+# Tokens substituted at install time by sed:
+#   {{LABEL}} {{CLAUDECRON_RUNNER}} {{RESOLVED_PATH}} {{CLAUDECRON_HOME}}
+[Unit]
+Description=claudecron runner ({{LABEL}})
+Documentation=https://github.com/octocat/hello-world
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart={{CLAUDECRON_RUNNER}} run --wake
+Environment=CLAUDECRON_HOME={{CLAUDECRON_HOME}} PATH={{RESOLVED_PATH}}
+TimeoutStartSec=600
+Nice=10
+IOSchedulingClass=idle

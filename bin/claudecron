@@ -1,0 +1,1137 @@
+#!/usr/bin/env bash
+#
+# claudecron - schedule and run autonomous agent loops on a fixed cadence.
+#
+# Copyright (c) 2026 The claudecron authors
+#
+# This is the CLI entrypoint. It self-locates its real install path (through
+# any chain of symlinks), discovers its libexec directory (the one containing
+# bin/ lib/ templates/ VERSION), sources the library modules in dependency
+# order, and dispatches subcommands.
+#
+# Portability: pure bash that must run under macOS /bin/bash 3.2.
+#   - no mapfile / readarray
+#   - no flock (mkdir is used as the lock mutex inside lib/lock.sh)
+#   - no associative arrays (declare -A)
+#   - every array expansion under `set -u` is guarded as ${arr[@]+"${arr[@]}"}
+#   - BSD date (date -j) vs GNU date (date -d) is detected, not assumed
+#
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Self-location: resolve this script through symlinks to find the real file,
+# then walk up to the libexec root (the dir holding bin/ lib/ templates/).
+# macOS bash 3.2 has no `readlink -f`, so we follow [ -h ] links by hand.
+# ---------------------------------------------------------------------------
+_self_source="${BASH_SOURCE[0]}"
+while [ -h "$_self_source" ]; do
+  _self_dir="$(cd -P "$(dirname "$_self_source")" >/dev/null 2>&1 && pwd)"
+  _self_link="$(readlink "$_self_source")"
+  case "$_self_link" in
+    /*) _self_source="$_self_link" ;;
+    *)  _self_source="$_self_dir/$_self_link" ;;
+  esac
+done
+_self_dir="$(cd -P "$(dirname "$_self_source")" >/dev/null 2>&1 && pwd)"
+
+# bin/ lives directly under the libexec root.
+CLAUDECRON_LIBEXEC="$(cd -P "$_self_dir/.." >/dev/null 2>&1 && pwd)"
+export CLAUDECRON_LIBEXEC
+
+CLAUDECRON_BIN_DIR="$_self_dir"
+CLAUDECRON_LIB_DIR="$CLAUDECRON_LIBEXEC/lib"
+CLAUDECRON_TEMPLATES_DIR="$CLAUDECRON_LIBEXEC/templates"
+export CLAUDECRON_BIN_DIR CLAUDECRON_LIB_DIR CLAUDECRON_TEMPLATES_DIR
+
+if [ ! -d "$CLAUDECRON_LIB_DIR" ]; then
+  printf 'claudecron: fatal: cannot locate lib/ under %s\n' "$CLAUDECRON_LIBEXEC" >&2
+  printf 'claudecron: the install appears broken; reinstall claudecron.\n' >&2
+  exit 1
+fi
+
+# Program version (libexec/VERSION). Best-effort; never fatal.
+if [ -f "$CLAUDECRON_LIBEXEC/VERSION" ]; then
+  CLAUDECRON_VERSION="$(cat "$CLAUDECRON_LIBEXEC/VERSION" 2>/dev/null || true)"
+fi
+: "${CLAUDECRON_VERSION:=0.0.0-dev}"
+export CLAUDECRON_VERSION
+
+# CLAUDECRON_PREFIX is the install prefix (libexec/..) when claudecron is
+# installed under <prefix>/share/claudecron. Exported for the scheduler
+# templates so generated units can call the absolute path to this binary.
+CLAUDECRON_PREFIX="${CLAUDECRON_PREFIX:-$CLAUDECRON_LIBEXEC}"
+CLAUDECRON_SELF="$CLAUDECRON_BIN_DIR/claudecron"
+export CLAUDECRON_PREFIX CLAUDECRON_SELF
+
+# ---------------------------------------------------------------------------
+# Source library modules in dependency order. common.sh defines the logging
+# and jq helpers everything else relies on, so it goes first.
+# ---------------------------------------------------------------------------
+_cc_source() {
+  # $1 = lib basename. Fail loudly if a required module is missing.
+  local _f="$CLAUDECRON_LIB_DIR/$1"
+  if [ ! -f "$_f" ]; then
+    printf 'claudecron: fatal: missing library %s\n' "$_f" >&2
+    exit 1
+  fi
+  # shellcheck source=/dev/null
+  . "$_f"
+}
+
+_cc_source common.sh
+_cc_source config.sh
+_cc_source state.sh
+_cc_source lock.sh
+_cc_source due.sh
+_cc_source backend.sh
+_cc_source runner.sh
+_cc_source scheduler.sh
+_cc_source skills.sh
+_cc_source compat.sh
+
+# ---------------------------------------------------------------------------
+# Global flags. Parsed before the subcommand so that `--config DIR`, `--json`,
+# `-q`/`-v` can appear anywhere up front. The first non-flag token is the
+# subcommand; everything after it is passed through untouched.
+# ---------------------------------------------------------------------------
+CC_JSON=0          # global --json: machine-readable output where supported
+CC_VERBOSITY=1     # 0 quiet, 1 normal, 2 verbose
+CC_CONFIG_OVERRIDE=""
+export CC_JSON CC_VERBOSITY
+
+_cc_global_args=""
+
+usage() {
+  cat <<EOF
+claudecron $CLAUDECRON_VERSION - run autonomous agent loops on a schedule
+
+Usage:
+  claudecron <command> [options]
+
+Commands:
+  init                 Create the data dir, write default config + registry,
+                       and install the scheduler.
+  add <id>             Add a loop. Bare = interactive; flags = scripted.
+  list                 List loop ids (terse).
+  status               Dashboard table of all loops.
+  run                  Run one due pass (same path the scheduler takes).
+  logs <id>            Tail a loop's log (or the runner log with --runner).
+  enable <id>          Enable a loop (or the scheduler with --scheduler).
+  disable <id>         Disable a loop (or the scheduler with --scheduler).
+  remove <id>          Remove a loop entry.
+  doctor               Preflight checks; non-zero on any failure.
+  scheduler <action>   install | remove | status.
+  skills <action>      install | remove | status (Claude Code + Codex).
+  uninstall            Remove the scheduler + skills (and data with --purge).
+  version              Print the claudecron version.
+  help                 Show this help.
+
+Global options:
+  --json               Machine-readable output where supported.
+  --config <dir>       Use <dir> as CLAUDECRON_HOME for this invocation.
+  -q, --quiet          Less output.
+  -v, --verbose        More output.
+
+Examples:
+  claudecron init --backend claude
+  claudecron add pr-babysitter --interval 15 --cwd "\$HOME/src/hello-world" \\
+      --tools "Bash,Read,Write" --prompt-file ./pr.md
+  claudecron run --now pr-babysitter
+  claudecron status
+  claudecron logs daily-digest -f
+
+Data dir resolution order:
+  \$CLAUDECRON_HOME -> \$XDG_CONFIG_HOME/claudecron -> ~/.config/claudecron
+EOF
+}
+
+# Parse leading global flags. Stops at the first non-flag token (subcommand).
+_parse_globals() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --json)         CC_JSON=1; shift ;;
+      --config)
+        if [ "$#" -lt 2 ]; then
+          cc_die "--config requires a directory argument"
+        fi
+        CC_CONFIG_OVERRIDE="$2"; shift 2 ;;
+      --config=*)     CC_CONFIG_OVERRIDE="${1#*=}"; shift ;;
+      -q|--quiet)     CC_VERBOSITY=0; shift ;;
+      -v|--verbose)   CC_VERBOSITY=2; shift ;;
+      --)             shift; break ;;
+      -h|--help)      _cc_global_args="help"; return 0 ;;
+      -*)
+        # Unknown global flag before the subcommand.
+        printf 'claudecron: unknown option: %s\n\n' "$1" >&2
+        usage >&2
+        exit 2 ;;
+      *)              break ;;
+    esac
+  done
+  # Remaining positional args (subcommand + its args) are returned via the
+  # global _CC_REST array so bash 3.2 can pass them on without word-splitting.
+  _CC_REST=( ${@+"$@"} )
+}
+
+_CC_REST=()
+_parse_globals ${@+"$@"}
+
+if [ "$_cc_global_args" = "help" ]; then
+  usage
+  exit 0
+fi
+
+# Apply --config override, then recompute all derived paths via cc_rehome
+# (defined in lib/common.sh). CLAUDECRON_HOME is honored first by cc__resolve_home.
+if [ -n "$CC_CONFIG_OVERRIDE" ]; then
+  CLAUDECRON_HOME="$CC_CONFIG_OVERRIDE"
+  export CLAUDECRON_HOME
+  cc_rehome
+fi
+
+# ---------------------------------------------------------------------------
+# Subcommand dispatch.
+# ---------------------------------------------------------------------------
+if [ "${#_CC_REST[@]}" -eq 0 ]; then
+  usage >&2
+  exit 2
+fi
+
+_cmd="${_CC_REST[0]}"
+# Shift the subcommand off; the rest are its arguments.
+set -- ${_CC_REST[@]+"${_CC_REST[@]}"}
+shift
+
+# ===========================================================================
+# init
+# ===========================================================================
+cmd_init() {
+  local no_scheduler=0
+  local no_skills=0
+  local backend=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --no-scheduler) no_scheduler=1; shift ;;
+      --no-skills)    no_skills=1; shift ;;
+      --backend)
+        [ "$#" -ge 2 ] || cc_die "--backend requires a value (claude|codex)"
+        backend="$2"; shift 2 ;;
+      --backend=*)    backend="${1#*=}"; shift ;;
+      -h|--help)
+        cat <<EOF
+Usage: claudecron init [--backend claude|codex] [--no-scheduler] [--no-skills]
+
+Creates <CLAUDECRON_HOME> with default config.json and registry.json,
+seeds the prompts/ state/ logs/ lock/ subdirectories, installs the platform
+scheduler unless --no-scheduler is given, and installs the agent skills for
+Claude Code and Codex (so you can create loops by talking to your agent)
+unless --no-skills is given. Idempotent: an existing config or registry is
+never clobbered.
+EOF
+        return 0 ;;
+      *) cc_die "init: unexpected argument: $1" ;;
+    esac
+  done
+
+  if [ -n "$backend" ]; then
+    case "$backend" in
+      claude|codex) : ;;
+      *) cc_die "init: --backend must be 'claude' or 'codex' (got '$backend')" ;;
+    esac
+  fi
+
+  cc_mkdirs
+  cc_log info "data home: $CLAUDECRON_HOME"
+
+  # Write defaults without clobbering existing files.
+  cfg_init_defaults
+  if [ -n "$backend" ]; then
+    cfg_set backend "$backend"
+    cc_log info "backend set to $backend"
+  fi
+
+  loop_registry_init
+
+  if [ "$no_scheduler" -eq 1 ]; then
+    cc_log info "skipping scheduler install (--no-scheduler)"
+  elif [ "${CLAUDECRON_INIT_SCHEDULER:-1}" = "0" ]; then
+    cc_log info "skipping scheduler install (CLAUDECRON_INIT_SCHEDULER=0)"
+  else
+    local sched
+    sched="$(detect_scheduler)"
+    cc_log info "detected scheduler: $sched"
+    if [ "$sched" = "none" ]; then
+      cc_log warn "no supported scheduler found; run loops manually with 'claudecron run'"
+    else
+      scheduler_install
+    fi
+  fi
+
+  # Install the agent skills so users can create loops conversationally.
+  if [ "$no_skills" -eq 1 ]; then
+    cc_log info "skipping skills install (--no-skills)"
+  else
+    skills_install || cc_log warn "skills install reported a problem (continuing)"
+  fi
+
+  cc_log info "init complete. add a loop with: claudecron add <id>"
+}
+
+# ===========================================================================
+# add
+# ===========================================================================
+cmd_add() {
+  local id=""
+  local interval=""
+  local cwd=""
+  local tools=""
+  local backend=""
+  local prompt_inline=""
+  local prompt_file_src=""
+  local prompt_from_stdin=0
+  local enabled="true"
+  local force=0
+  local interactive=1
+  # add_dirs collected as a repeatable flag.
+  local add_dirs=()
+
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --interval)
+        [ "$#" -ge 2 ] || cc_die "--interval requires minutes"
+        interval="$2"; interactive=0; shift 2 ;;
+      --interval=*) interval="${1#*=}"; interactive=0; shift ;;
+      --cwd)
+        [ "$#" -ge 2 ] || cc_die "--cwd requires a path"
+        cwd="$2"; interactive=0; shift 2 ;;
+      --cwd=*) cwd="${1#*=}"; interactive=0; shift ;;
+      --add-dir)
+        [ "$#" -ge 2 ] || cc_die "--add-dir requires a path"
+        add_dirs[${#add_dirs[@]}]="$2"; interactive=0; shift 2 ;;
+      --add-dir=*) add_dirs[${#add_dirs[@]}]="${1#*=}"; interactive=0; shift ;;
+      --tools)
+        [ "$#" -ge 2 ] || cc_die "--tools requires a comma list"
+        tools="$2"; interactive=0; shift 2 ;;
+      --tools=*) tools="${1#*=}"; interactive=0; shift ;;
+      --backend)
+        [ "$#" -ge 2 ] || cc_die "--backend requires a value"
+        backend="$2"; interactive=0; shift 2 ;;
+      --backend=*) backend="${1#*=}"; interactive=0; shift ;;
+      --prompt)
+        [ "$#" -ge 2 ] || cc_die "--prompt requires text"
+        prompt_inline="$2"; interactive=0; shift 2 ;;
+      --prompt=*) prompt_inline="${1#*=}"; interactive=0; shift ;;
+      --prompt-file)
+        [ "$#" -ge 2 ] || cc_die "--prompt-file requires a path"
+        prompt_file_src="$2"; interactive=0; shift 2 ;;
+      --prompt-file=*) prompt_file_src="${1#*=}"; interactive=0; shift ;;
+      -)  prompt_from_stdin=1; interactive=0; shift ;;
+      --enabled)  enabled="true";  interactive=0; shift ;;
+      --disabled) enabled="false"; interactive=0; shift ;;
+      --force)    force=1; shift ;;
+      -h|--help)
+        cat <<EOF
+Usage: claudecron add <id> [options]
+
+Scripted:
+  --interval <minutes>     How often the loop is due (default 15).
+  --cwd <abs-dir>          Working directory for the agent.
+  --add-dir <abs-dir>      Extra dir the agent may access (repeatable).
+  --tools <T1,T2,...>      Allowed tools, comma-separated.
+  --backend claude|codex   Backend for this loop (default: config backend).
+  --prompt <text>          Inline prompt text.
+  --prompt-file <path>     Read prompt from a file.
+  -                        Read prompt from stdin.
+  --enabled | --disabled   Initial enabled state (default enabled).
+  --force                  Overwrite an existing loop with the same id.
+
+Run with just <id> for an interactive prompt. add NEVER runs the loop.
+
+Example:
+  claudecron add pr-babysitter --interval 15 \\
+      --cwd "\$HOME/src/hello-world" --tools "Bash,Read" --prompt-file ./pr.md
+EOF
+        return 0 ;;
+      -*) cc_die "add: unknown option: $1" ;;
+      *)
+        if [ -z "$id" ]; then
+          id="$1"; shift
+        else
+          cc_die "add: unexpected argument: $1"
+        fi ;;
+    esac
+  done
+
+  [ -n "$id" ] || cc_die "add: missing loop <id> (e.g. pr-babysitter)"
+  _cc_validate_id "$id"
+
+  # Refuse to overwrite unless --force.
+  if loop_get "$id" >/dev/null 2>&1 && [ "$force" -ne 1 ]; then
+    cc_die "loop '$id' already exists; pass --force to overwrite"
+  fi
+
+  # Interactive path: bare invocation with no scripting flags.
+  if [ "$interactive" -eq 1 ]; then
+    _cc_add_interactive_collect
+    # _cc_add_interactive_collect populates: interval cwd tools backend
+    #   add_dirs[] enabled prompt_inline
+  fi
+
+  # Defaults for anything still unset.
+  [ -n "$interval" ] || interval=15
+  # Accept friendly forms (15, 15m, 2h) via the shared parser, which normalizes
+  # to integer minutes and rejects sub-minute values.
+  interval="$(parse_interval "$interval")" \
+    || cc_die "add: --interval must be a positive duration like 15, 15m, or 2h"
+  [ "$interval" -ge 1 ] || cc_die "add: --interval must be >= 1 minute"
+
+  if [ -z "$cwd" ]; then
+    cwd="$PWD"
+    cc_log warn "no --cwd given; defaulting to $cwd"
+  fi
+  case "$cwd" in
+    /*) : ;;
+    *)  cc_die "add: --cwd must be an absolute path (got '$cwd')" ;;
+  esac
+  [ -d "$cwd" ] || cc_log warn "cwd does not exist yet: $cwd"
+
+  # Validate add_dirs are absolute.
+  local d
+  for d in ${add_dirs[@]+"${add_dirs[@]}"}; do
+    case "$d" in
+      /*) : ;;
+      *)  cc_die "add: --add-dir must be absolute (got '$d')" ;;
+    esac
+  done
+
+  [ -n "$tools" ] || tools="Bash,Read,Write,Edit"
+
+  if [ -z "$backend" ]; then
+    backend="$(cfg_get backend)"
+    [ -n "$backend" ] || backend="claude"
+  fi
+  case "$backend" in
+    claude|codex) : ;;
+    *) cc_die "add: backend must be 'claude' or 'codex' (got '$backend')" ;;
+  esac
+
+  # Resolve the prompt content from exactly one source.
+  local prompt_content=""
+  local sources=0
+  [ -n "$prompt_inline" ]    && sources=$((sources + 1))
+  [ -n "$prompt_file_src" ]  && sources=$((sources + 1))
+  [ "$prompt_from_stdin" -eq 1 ] && sources=$((sources + 1))
+  if [ "$sources" -gt 1 ]; then
+    cc_die "add: choose only one of --prompt, --prompt-file, or - (stdin)"
+  fi
+
+  if [ -n "$prompt_inline" ]; then
+    prompt_content="$prompt_inline"
+  elif [ -n "$prompt_file_src" ]; then
+    [ -f "$prompt_file_src" ] || cc_die "add: prompt file not found: $prompt_file_src"
+    prompt_content="$(cat "$prompt_file_src")"
+  elif [ "$prompt_from_stdin" -eq 1 ]; then
+    prompt_content="$(cat)"
+  fi
+
+  if [ -z "$prompt_content" ]; then
+    cc_die "add: empty prompt; provide --prompt, --prompt-file, or - (stdin)"
+  fi
+
+  # Write the prompt file under prompts/<id>.md.
+  local prompt_rel="prompts/${id}.md"
+  local prompt_abs="$CLAUDECRON_HOME/$prompt_rel"
+  mkdir -p "$CLAUDECRON_HOME/prompts"
+  printf '%s\n' "$prompt_content" > "$prompt_abs"
+  cc_log info "wrote prompt: $prompt_abs"
+
+  # Build the add-dir JSON array via cc_jq from the collected list.
+  local add_dirs_json
+  add_dirs_json="$(_cc_dirs_to_json ${add_dirs[@]+"${add_dirs[@]}"})"
+
+  # Upsert the registry entry. loop_upsert takes the full JSON object on stdin.
+  cc_jq -n \
+    --arg id "$id" \
+    --argjson enabled "$enabled" \
+    --argjson interval "$interval" \
+    --arg cwd "$cwd" \
+    --argjson add_dirs "$add_dirs_json" \
+    --arg tools "$tools" \
+    --arg prompt_file "$prompt_rel" \
+    --arg backend "$backend" \
+    '{
+       id: $id,
+       enabled: $enabled,
+       interval_minutes: $interval,
+       cwd: $cwd,
+       add_dirs: $add_dirs,
+       allowed_tools: $tools,
+       prompt_file: $prompt_file,
+       backend: $backend
+     }' | loop_upsert "$id"
+
+  cc_log info "added loop '$id' (interval ${interval}m, backend $backend, enabled=$enabled)"
+  cc_log info "it will NOT run until the scheduler fires; test now with: claudecron run --now $id"
+}
+
+# Interactive collection helper for `add`. Reads from /dev/tty so it works
+# even when stdin is otherwise redirected. Sets caller locals by name via
+# the shared parent scope (these are declared in cmd_add).
+_cc_add_interactive_collect() {
+  local _ans
+  printf 'Configuring loop "%s" (press Enter to accept the default).\n' "$id" >&2
+
+  _cc_ask "Interval in minutes" "15"; interval="$_cc_reply"
+  _cc_ask "Working directory (absolute)" "$PWD"; cwd="$_cc_reply"
+  _cc_ask "Allowed tools (comma-separated)" "Bash,Read,Write,Edit"; tools="$_cc_reply"
+
+  local _def_backend
+  _def_backend="$(cfg_get backend)"; [ -n "$_def_backend" ] || _def_backend="claude"
+  _cc_ask "Backend (claude|codex)" "$_def_backend"; backend="$_cc_reply"
+
+  # Optional extra dirs, one per line, blank to finish.
+  printf 'Extra accessible dirs (--add-dir), one per line, blank to finish:\n' >&2
+  while :; do
+    printf '  add-dir> ' >&2
+    if ! IFS= read -r _ans < /dev/tty; then break; fi
+    [ -z "$_ans" ] && break
+    add_dirs[${#add_dirs[@]}]="$_ans"
+  done
+
+  _cc_ask "Enabled now? (y/n)" "y"
+  case "$_cc_reply" in
+    n|N|no|NO) enabled="false" ;;
+    *)         enabled="true" ;;
+  esac
+
+  printf 'Enter the prompt. Finish with a single line containing only EOF:\n' >&2
+  local _line _buf=""
+  while IFS= read -r _line < /dev/tty; do
+    [ "$_line" = "EOF" ] && break
+    _buf="${_buf}${_line}
+"
+  done
+  prompt_inline="$_buf"
+}
+
+# Ask a single question with a default. Result in $_cc_reply.
+_cc_ask() {
+  local _q="$1" _def="$2" _r=""
+  printf '%s [%s]: ' "$_q" "$_def" >&2
+  if IFS= read -r _r < /dev/tty; then :; fi
+  [ -n "$_r" ] || _r="$_def"
+  _cc_reply="$_r"
+}
+_cc_reply=""
+
+# Convert a list of dir args into a JSON array string.
+_cc_dirs_to_json() {
+  if [ "$#" -eq 0 ]; then
+    printf '[]'
+    return 0
+  fi
+  local _out
+  _out="$(
+    for d in "$@"; do printf '%s\n' "$d"; done \
+      | cc_jq -R . | cc_jq -s .
+  )"
+  printf '%s' "$_out"
+}
+
+# Validate a loop id is a safe slug (filesystem + json friendly).
+_cc_validate_id() {
+  case "$1" in
+    ''|*[!a-zA-Z0-9._-]*)
+      cc_die "invalid loop id '$1' (allowed: letters, digits, dot, dash, underscore)" ;;
+  esac
+}
+
+# ===========================================================================
+# list
+# ===========================================================================
+cmd_list() {
+  local as_json="$CC_JSON"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --json) as_json=1; shift ;;
+      -h|--help) printf 'Usage: claudecron list [--json]\n'; return 0 ;;
+      *) cc_die "list: unexpected argument: $1" ;;
+    esac
+  done
+
+  if [ "$as_json" -eq 1 ]; then
+    cc_jq '[.loops[].id]' "$(loop_registry_path)"
+    return 0
+  fi
+
+  local ids
+  ids="$(cc_jq -r '.loops[].id' "$(loop_registry_path)" 2>/dev/null || true)"
+  if [ -z "$ids" ]; then
+    cc_log info "no loops yet; add one with: claudecron add <id>"
+    return 0
+  fi
+  printf '%s\n' "$ids"
+}
+
+# ===========================================================================
+# status
+# ===========================================================================
+cmd_status() {
+  local as_json="$CC_JSON"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --json) as_json=1; shift ;;
+      -h|--help) printf 'Usage: claudecron status [--json]\n'; return 0 ;;
+      *) cc_die "status: unexpected argument: $1" ;;
+    esac
+  done
+
+  local ids
+  ids="$(cc_jq -r '.loops[].id' "$(loop_registry_path)" 2>/dev/null || true)"
+
+  if [ "$as_json" -eq 1 ]; then
+    _cc_status_json
+    return 0
+  fi
+
+  if [ -z "$ids" ]; then
+    cc_log info "no loops registered"
+    return 0
+  fi
+
+  # Header.
+  printf '%-20s %-8s %-9s %-8s %-20s %-9s %s\n' \
+    ID ENABLED INTERVAL BACKEND LAST_RUN STATUS NEXT_DUE
+  printf '%-20s %-8s %-9s %-8s %-20s %-9s %s\n' \
+    -------------------- -------- --------- -------- -------------------- --------- --------
+
+  local id entry enabled interval backend last_run last_status next_due
+  printf '%s\n' "$ids" | while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    entry="$(loop_get "$id")"
+    enabled="$(printf '%s' "$entry"  | cc_jq -r '.enabled')"
+    interval="$(printf '%s' "$entry" | cc_jq -r '.interval_minutes')"
+    backend="$(printf '%s' "$entry"  | cc_jq -r '.backend')"
+
+    last_run="$(state_get "$id" last_run)"
+    [ -n "$last_run" ] || last_run="-"
+    last_status="$(state_get "$id" last_status)"
+    [ -n "$last_status" ] || last_status="-"
+
+    if is_due "$id" >/dev/null 2>&1; then
+      next_due="now"
+    else
+      next_due="$(_cc_next_due_human "$id" "$interval")"
+    fi
+
+    printf '%-20s %-8s %-9s %-8s %-20s %-9s %s\n' \
+      "$id" "$enabled" "${interval}m" "$backend" "$last_run" "$last_status" "$next_due"
+  done
+}
+
+_cc_status_json() {
+  local ids id entry last_run last_status
+  ids="$(cc_jq -r '.loops[].id' "$(loop_registry_path)" 2>/dev/null || true)"
+  printf '['
+  local first=1
+  printf '%s\n' "$ids" | while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    entry="$(loop_get "$id")"
+    last_run="$(state_get "$id" last_run)"
+    last_status="$(state_get "$id" last_status)"
+    if [ "$first" -eq 1 ]; then first=0; else printf ','; fi
+    printf '%s' "$entry" | cc_jq -c \
+      --arg last_run "$last_run" \
+      --arg last_status "$last_status" \
+      '{id, enabled, interval_minutes, backend,
+        last_run: ($last_run // ""),
+        last_status: ($last_status // "")}'
+  done
+  printf ']\n'
+}
+
+# Best-effort human next-due. Uses state last_run + interval. Falls back to
+# the interval string if dates cannot be computed on this platform.
+_cc_next_due_human() {
+  local id="$1" interval="$2" last_epoch
+  last_epoch="$(state_get "$id" last_run_epoch)"
+  if [ -z "$last_epoch" ]; then
+    printf 'now'
+    return 0
+  fi
+  local now_epoch due_epoch remain_min
+  now_epoch="$(date +%s)"
+  due_epoch=$(( last_epoch + interval * 60 ))
+  if [ "$now_epoch" -ge "$due_epoch" ]; then
+    printf 'now'
+    return 0
+  fi
+  remain_min=$(( (due_epoch - now_epoch + 59) / 60 ))
+  printf 'in %dm' "$remain_min"
+}
+
+# ===========================================================================
+# run
+# ===========================================================================
+cmd_run() {
+  local force_id=""
+  local dry_run=0
+  local backend_override=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --now)
+        [ "$#" -ge 2 ] || cc_die "--now requires a loop id"
+        force_id="$2"; shift 2 ;;
+      --now=*) force_id="${1#*=}"; shift ;;
+      --dry-run) dry_run=1; shift ;;
+      --backend)
+        [ "$#" -ge 2 ] || cc_die "--backend requires a value"
+        backend_override="$2"; shift 2 ;;
+      --backend=*) backend_override="${1#*=}"; shift ;;
+      --wake) shift ;;   # alias the scheduler uses; identical to a bare pass
+      -h|--help)
+        cat <<EOF
+Usage: claudecron run [--now <id>] [--dry-run] [--backend claude|codex] [--wake]
+
+  (bare)        Run one full due pass over all enabled loops.
+  --now <id>    Force one run of <id> regardless of due time / enabled state.
+  --dry-run     Show what would run without invoking any backend.
+  --backend B   Override the backend for this invocation.
+  --wake        Alias for a bare pass (used by the scheduler).
+EOF
+        return 0 ;;
+      -*) cc_die "run: unknown option: $1" ;;
+      *) cc_die "run: unexpected argument: $1" ;;
+    esac
+  done
+
+  if [ -n "$backend_override" ]; then
+    case "$backend_override" in
+      claude|codex) : ;;
+      *) cc_die "run: --backend must be 'claude' or 'codex'" ;;
+    esac
+    CLAUDECRON_BACKEND_OVERRIDE="$backend_override"
+    export CLAUDECRON_BACKEND_OVERRIDE
+  fi
+  if [ "$dry_run" -eq 1 ]; then
+    CLAUDECRON_DRY_RUN=1
+    export CLAUDECRON_DRY_RUN
+  fi
+
+  if [ -n "$force_id" ]; then
+    _cc_validate_id "$force_id"
+    loop_get "$force_id" >/dev/null 2>&1 || cc_die "run: no such loop '$force_id'"
+    cc_log info "forcing run of '$force_id' (ignoring due/enabled)"
+    cc_run --id "$force_id" --force
+    return $?
+  fi
+
+  # Bare / --wake: a single due pass over the whole registry.
+  cc_log info "starting due pass on $(cc_hostname_s)"
+  cc_run_pass
+}
+
+# ===========================================================================
+# logs
+# ===========================================================================
+cmd_logs() {
+  local id=""
+  local follow=0
+  local lines=""
+  local runner=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -f|--follow) follow=1; shift ;;
+      -n)
+        [ "$#" -ge 2 ] || cc_die "-n requires a line count"
+        lines="$2"; shift 2 ;;
+      -n*) lines="${1#-n}"; shift ;;
+      --lines=*) lines="${1#*=}"; shift ;;
+      --runner) runner=1; shift ;;
+      -h|--help)
+        cat <<EOF
+Usage: claudecron logs <id> [-f] [-n N] [--runner]
+
+  <id>        Tail prompts/<id>.log (per-loop output).
+  -f          Follow (tail -f).
+  -n N        Show the last N lines (default 200).
+  --runner    Tail the shared runner log instead of a per-loop log.
+EOF
+        return 0 ;;
+      -*) cc_die "logs: unknown option: $1" ;;
+      *)
+        if [ -z "$id" ]; then id="$1"; shift; else cc_die "logs: unexpected argument: $1"; fi ;;
+    esac
+  done
+
+  [ -n "$lines" ] || lines=200
+  case "$lines" in ''|*[!0-9]*) cc_die "logs: -n must be a number" ;; esac
+
+  local target
+  if [ "$runner" -eq 1 ]; then
+    target="$CLAUDECRON_HOME/logs/runner.log"
+  else
+    [ -n "$id" ] || cc_die "logs: missing <id> (or pass --runner for the runner log)"
+    _cc_validate_id "$id"
+    target="$CLAUDECRON_HOME/logs/${id}.log"
+  fi
+
+  if [ ! -f "$target" ]; then
+    cc_log warn "no log yet at $target"
+    return 0
+  fi
+
+  if [ "$follow" -eq 1 ]; then
+    tail -n "$lines" -f "$target"
+  else
+    tail -n "$lines" "$target"
+  fi
+}
+
+# ===========================================================================
+# enable / disable
+# ===========================================================================
+cmd_enable()  { _cc_toggle enable  ${@+"$@"}; }
+cmd_disable() { _cc_toggle disable ${@+"$@"}; }
+
+_cc_toggle() {
+  local verb="$1"; shift
+  local want="true"
+  [ "$verb" = "disable" ] && want="false"
+
+  local id=""
+  local scheduler=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --scheduler) scheduler=1; shift ;;
+      -h|--help)
+        printf 'Usage: claudecron %s <id>\n       claudecron %s --scheduler\n' "$verb" "$verb"
+        return 0 ;;
+      -*) cc_die "$verb: unknown option: $1" ;;
+      *)
+        if [ -z "$id" ]; then id="$1"; shift; else cc_die "$verb: unexpected argument: $1"; fi ;;
+    esac
+  done
+
+  if [ "$scheduler" -eq 1 ]; then
+    if [ "$verb" = "enable" ]; then
+      scheduler_enable
+      cc_log info "scheduler enabled"
+    else
+      scheduler_disable
+      cc_log info "scheduler disabled (loops will not fire until re-enabled)"
+    fi
+    return 0
+  fi
+
+  [ -n "$id" ] || cc_die "$verb: missing <id> (or pass --scheduler)"
+  _cc_validate_id "$id"
+  loop_get "$id" >/dev/null 2>&1 || cc_die "$verb: no such loop '$id'"
+
+  loop_get "$id" | cc_jq -c --argjson e "$want" '.enabled = $e' | loop_upsert "$id"
+  cc_log info "loop '$id' ${verb}d"
+}
+
+# ===========================================================================
+# remove
+# ===========================================================================
+cmd_remove() {
+  local id=""
+  local purge=0
+  local yes=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --purge) purge=1; shift ;;
+      --yes|-y) yes=1; shift ;;
+      -h|--help)
+        cat <<EOF
+Usage: claudecron remove <id> [--purge] [--yes]
+
+  Removes the registry entry for <id>.
+  --purge   Also delete prompts/<id>.md and state/*/<id>.json.
+  --yes     Skip the confirmation prompt.
+EOF
+        return 0 ;;
+      -*) cc_die "remove: unknown option: $1" ;;
+      *)
+        if [ -z "$id" ]; then id="$1"; shift; else cc_die "remove: unexpected argument: $1"; fi ;;
+    esac
+  done
+
+  [ -n "$id" ] || cc_die "remove: missing <id>"
+  _cc_validate_id "$id"
+  loop_get "$id" >/dev/null 2>&1 || cc_die "remove: no such loop '$id'"
+
+  if [ "$yes" -ne 1 ]; then
+    local _ans=""
+    printf 'Remove loop "%s"%s? [y/N]: ' "$id" "$( [ "$purge" -eq 1 ] && printf ' and PURGE its prompt+state' )" >&2
+    if IFS= read -r _ans < /dev/tty 2>/dev/null; then :; fi
+    case "$_ans" in
+      y|Y|yes|YES) : ;;
+      *) cc_log info "aborted"; return 0 ;;
+    esac
+  fi
+
+  loop_remove "$id"
+  cc_log info "removed registry entry '$id'"
+
+  if [ "$purge" -eq 1 ]; then
+    local pf="$CLAUDECRON_HOME/prompts/${id}.md"
+    if [ -f "$pf" ]; then rm -f "$pf"; cc_log info "purged $pf"; fi
+    # Remove per-host state files for this id across all hosts.
+    local sd
+    if [ -d "$CLAUDECRON_HOME/state" ]; then
+      for sd in "$CLAUDECRON_HOME"/state/*/; do
+        [ -d "$sd" ] || continue
+        if [ -f "${sd}${id}.json" ]; then
+          rm -f "${sd}${id}.json"
+          cc_log info "purged ${sd}${id}.json"
+        fi
+      done
+    fi
+  fi
+}
+
+# ===========================================================================
+# doctor
+# ===========================================================================
+cmd_doctor() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -h|--help) printf 'Usage: claudecron doctor\n\nRuns preflight checks. Exits non-zero if any check FAILs.\n'; return 0 ;;
+      *) cc_die "doctor: unexpected argument: $1" ;;
+    esac
+  done
+
+  local fails=0
+  _doc_ok()   { printf '  [ OK ] %s\n' "$1"; }
+  _doc_warn() { printf '  [WARN] %s\n' "$1"; }
+  _doc_fail() { printf '  [FAIL] %s\n' "$1"; fails=$((fails + 1)); }
+
+  printf 'claudecron doctor (%s)\n' "$CLAUDECRON_VERSION"
+  printf 'home: %s\n' "$CLAUDECRON_HOME"
+  printf 'libexec: %s\n\n' "$CLAUDECRON_LIBEXEC"
+
+  # 1. bash version (need 3.2+; we target macOS 3.2).
+  printf 'environment:\n'
+  local bash_major="${BASH_VERSINFO[0]:-0}"
+  local bash_minor="${BASH_VERSINFO[1]:-0}"
+  if [ "$bash_major" -gt 3 ] || { [ "$bash_major" -eq 3 ] && [ "$bash_minor" -ge 2 ]; }; then
+    _doc_ok "bash ${BASH_VERSION}"
+  else
+    _doc_fail "bash ${BASH_VERSION} is too old; need 3.2+"
+  fi
+
+  # 2. jq present.
+  if command -v jq >/dev/null 2>&1; then
+    _doc_ok "jq $(jq --version 2>/dev/null || true)"
+  else
+    _doc_fail "jq not found in PATH; install jq (brew install jq / apt-get install jq)"
+  fi
+
+  # 3. date flavor.
+  if date -j >/dev/null 2>&1; then
+    _doc_ok "date: BSD (date -j) detected"
+  elif date -d @0 >/dev/null 2>&1; then
+    _doc_ok "date: GNU (date -d) detected"
+  else
+    _doc_warn "date: could not classify; due-time math may be limited"
+  fi
+
+  # 4. backend binaries.
+  printf '\nbackends:\n'
+  printf '  PATH=%s\n' "$PATH"
+  local cfg_backend cbin xbin
+  cfg_backend="$(cfg_get backend 2>/dev/null || true)"
+  [ -n "$cfg_backend" ] || cfg_backend="claude"
+  printf '  configured backend: %s\n' "$cfg_backend"
+
+  cbin="$(resolve_backend_bin claude 2>/dev/null || true)"
+  if [ -n "$cbin" ] && [ -x "$cbin" ]; then
+    _doc_ok "claude -> $cbin ($("$cbin" --version 2>/dev/null | head -n1 || echo '?'))"
+  else
+    if [ "$cfg_backend" = "claude" ]; then
+      _doc_fail "claude backend not resolved; set claude_bin in config.json or add it to PATH"
+    else
+      _doc_warn "claude backend not resolved (not the active backend)"
+    fi
+  fi
+
+  xbin="$(resolve_backend_bin codex 2>/dev/null || true)"
+  if [ -n "$xbin" ] && [ -x "$xbin" ]; then
+    _doc_ok "codex -> $xbin ($("$xbin" --version 2>/dev/null | head -n1 || echo '?'))"
+  else
+    if [ "$cfg_backend" = "codex" ]; then
+      _doc_fail "codex backend not resolved; set codex_bin in config.json or add it to PATH"
+    else
+      _doc_warn "codex backend not resolved (not the active backend)"
+    fi
+  fi
+
+  # 5. registry validity.
+  printf '\nregistry:\n'
+  local reg
+  reg="$(loop_registry_path)"
+  if [ ! -f "$reg" ]; then
+    _doc_warn "no registry yet at $reg; run 'claudecron init'"
+  elif cc_jq -e '.loops | type == "array"' "$reg" >/dev/null 2>&1; then
+    local n
+    n="$(cc_jq -r '.loops | length' "$reg")"
+    _doc_ok "registry valid ($n loop(s))"
+  else
+    _doc_fail "registry is malformed: $reg (expected { \"loops\": [...] })"
+  fi
+
+  # 6. config validity.
+  local cfg
+  cfg="$(cfg_path)"
+  if [ ! -f "$cfg" ]; then
+    _doc_warn "no config yet at $cfg; run 'claudecron init'"
+  elif cc_jq -e '.' "$cfg" >/dev/null 2>&1; then
+    _doc_ok "config valid"
+  else
+    _doc_fail "config is not valid JSON: $cfg"
+  fi
+
+  # 7. scheduler.
+  printf '\nscheduler:\n'
+  local sched
+  sched="$(detect_scheduler 2>/dev/null || echo none)"
+  printf '  type: %s\n' "$sched"
+  if scheduler_is_loaded >/dev/null 2>&1; then
+    _doc_ok "scheduler unit loaded (dev.claudecron.runner)"
+    local lw
+    lw="$(scheduler_last_wake 2>/dev/null || true)"
+    [ -n "$lw" ] && printf '  last wake: %s\n' "$lw"
+  else
+    _doc_warn "scheduler not loaded; install with 'claudecron scheduler install'"
+  fi
+
+  # 8. stale lock.
+  printf '\nlock:\n'
+  if [ -d "$CLAUDECRON_HOME/lock" ] && [ "$(ls -A "$CLAUDECRON_HOME/lock" 2>/dev/null || true)" != "" ]; then
+    if lock_is_stale >/dev/null 2>&1; then
+      _doc_warn "a STALE lock is present; clear it with: rm -rf '$CLAUDECRON_HOME/lock'/*"
+    else
+      _doc_ok "a lock is held (a run may be in progress)"
+    fi
+  else
+    _doc_ok "no lock held"
+  fi
+
+  printf '\n'
+  if [ "$fails" -gt 0 ]; then
+    printf 'doctor: %d check(s) FAILED.\n' "$fails"
+    return 1
+  fi
+  printf 'doctor: all critical checks passed.\n'
+  return 0
+}
+
+# ===========================================================================
+# scheduler
+# ===========================================================================
+cmd_scheduler() {
+  local action=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        printf 'Usage: claudecron scheduler {install|remove|status}\n'; return 0 ;;
+      -*) cc_die "scheduler: unknown option: $1" ;;
+      *) if [ -z "$action" ]; then action="$1"; shift; else cc_die "scheduler: unexpected argument: $1"; fi ;;
+    esac
+  done
+
+  [ -n "$action" ] || cc_die "scheduler: need an action (install|remove|status)"
+  case "$action" in
+    install) scheduler_install ;;
+    remove)  scheduler_remove ;;
+    status)  scheduler_status ;;
+    *) cc_die "scheduler: unknown action '$action' (install|remove|status)" ;;
+  esac
+}
+
+# ===========================================================================
+# skills - install/remove the agent skills for Claude Code and Codex
+# ===========================================================================
+cmd_skills() {
+  local action="${1:-}"
+  case "$action" in
+    install) skills_install ;;
+    remove)  skills_remove ;;
+    status|"") skills_status ;;
+    -h|--help)
+      cat <<EOF
+Usage: claudecron skills <install|remove|status>
+
+  install   Install the claudecron skills into Claude Code (~/.claude/skills)
+            and Codex (~/.codex/prompts), wherever they are detected. This lets
+            you create and manage loops by talking to your agent.
+  remove    Remove the installed skills from both agents.
+  status    Show where the skills are installed (default).
+EOF
+      ;;
+    *) cc_die "skills: unknown action '$action' (install|remove|status)" ;;
+  esac
+}
+
+# ===========================================================================
+# uninstall
+# ===========================================================================
+cmd_uninstall() {
+  local purge=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --purge) purge=1; shift ;;
+      -h|--help)
+        cat <<EOF
+Usage: claudecron uninstall [--purge]
+
+  Removes the scheduler unit (dev.claudecron.runner) and the agent skills
+  installed into Claude Code and Codex.
+  --purge   Also delete the entire data home: $CLAUDECRON_HOME
+EOF
+        return 0 ;;
+      *) cc_die "uninstall: unexpected argument: $1" ;;
+    esac
+  done
+  cc_uninstall "$purge"
+  skills_remove
+}
+
+# ===========================================================================
+# version
+# ===========================================================================
+cmd_version() {
+  if [ "$CC_JSON" -eq 1 ]; then
+    cc_jq -n --arg v "$CLAUDECRON_VERSION" --arg libexec "$CLAUDECRON_LIBEXEC" \
+      '{name:"claudecron", version:$v, libexec:$libexec}'
+  else
+    printf 'claudecron %s\n' "$CLAUDECRON_VERSION"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch table.
+# ---------------------------------------------------------------------------
+case "$_cmd" in
+  init)       cmd_init       ${@+"$@"} ;;
+  add)        cmd_add        ${@+"$@"} ;;
+  list|ls)    cmd_list       ${@+"$@"} ;;
+  status|st)  cmd_status     ${@+"$@"} ;;
+  run)        cmd_run        ${@+"$@"} ;;
+  logs|log)   cmd_logs       ${@+"$@"} ;;
+  enable)     cmd_enable     ${@+"$@"} ;;
+  disable)    cmd_disable    ${@+"$@"} ;;
+  remove|rm)  cmd_remove     ${@+"$@"} ;;
+  doctor)     cmd_doctor     ${@+"$@"} ;;
+  scheduler)  cmd_scheduler  ${@+"$@"} ;;
+  skills)     cmd_skills     ${@+"$@"} ;;
+  uninstall)  cmd_uninstall  ${@+"$@"} ;;
+  version|--version|-V) cmd_version ${@+"$@"} ;;
+  help|--help|-h) usage ;;
+  *)
+    printf 'claudecron: unknown command: %s\n\n' "$_cmd" >&2
+    usage >&2
+    exit 2 ;;
+esac

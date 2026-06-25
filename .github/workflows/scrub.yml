@@ -1,0 +1,22 @@
+# Copyright (c) 2026 The claudecron authors
+#
+# Standalone privacy gate. Kept separate from ci.yml so it can be configured
+# as a required status check independently of the build/test matrix.
+name: scrub
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  scrub:
+    name: privacy scrub
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Privacy scrub
+        run: bash scripts/scrub-check.sh .

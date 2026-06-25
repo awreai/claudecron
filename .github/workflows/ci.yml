@@ -1,0 +1,52 @@
+# Copyright (c) 2026 The claudecron authors
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: shellcheck + smoke (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install jq + shellcheck (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq shellcheck
+
+      - name: Install jq + shellcheck (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install jq shellcheck
+
+      - name: Show tool versions
+        run: |
+          bash --version | head -n 1
+          jq --version
+          shellcheck --version
+
+      - name: ShellCheck
+        run: |
+          shellcheck -s bash \
+            bin/claudecron \
+            lib/*.sh \
+            scripts/*.sh \
+            install.sh \
+            uninstall.sh
+
+      - name: Smoke test
+        run: bash scripts/smoke-test.sh
+
+      - name: Privacy scrub
+        run: bash scripts/scrub-check.sh .
