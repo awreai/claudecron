@@ -39,6 +39,7 @@ jobs:
             bin \
             lib \
             templates \
+            skills \
             VERSION \
             README.md \
             LICENSE

@@ -1,0 +1,15 @@
+# shellcheck configuration for claudecron.
+#
+# These info-level codes are disabled because they flag intentional, correct
+# patterns throughout the codebase:
+#
+#   SC2016 - "expressions don't expand in single quotes". Nearly every single-
+#            quoted string here is a jq filter program (e.g. '.loops[].id' or
+#            '. + {last_run:$now}'). The $-tokens are jq variables, NOT shell
+#            variables, and MUST stay literal. This is correct by design.
+#
+#   SC2317 - "command appears unreachable". The double-source guards
+#            (if ...; then return 0 2>/dev/null || true; fi) are reached when a
+#            lib is sourced a second time; shellcheck cannot see that path.
+#
+disable=SC2016,SC2317
