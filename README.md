@@ -1,46 +1,53 @@
 # claudecron
 
-**Cron for headless AI coding agents.** Schedule a coding agent to run on a loop, locally, under your own user account. You write the prompt and the permissions; your OS scheduler wakes `claudecron` on an interval; `claudecron` runs the agent against a working directory and records state and logs. No server, no inbound surface, no cloud middleman.
+**Cron for headless AI coding agents.** Tell Claude Code or Codex to do a job on a schedule - "triage my PRs every 15 minutes", "summarize the error log every hour" - and it just happens, locally, on your machine. No server, no inbound surface, no cloud middleman.
 
-Think of it as a tiny, auditable supervisor that sits between your OS scheduler and a headless agent backend (`claude` or `codex`).
+`claudecron` is a tiny, auditable supervisor that sits between your OS scheduler and a headless agent (`claude` or `codex`). You describe the work in plain English to your agent; `claudecron` runs it on a cadence and reports back only when it matters.
 
-- **Local-first and least-privilege.** Every loop declares exactly which tools the agent may use and which directories it may touch. Nothing runs that you did not write into the registry.
-- **Stateless control plane, durable state.** The registry is plain JSON you can read, diff, and commit. Per-host state lives separately, so the same registry behaves correctly on multiple machines.
-- **Survives sleep.** If your laptop is asleep when a loop was due, `claudecron` runs it once on wake and moves the cursor forward. One catch-up run, not a thundering herd of missed ticks.
+- **Talk to your agent, not a config file.** The installer wires skills into Claude Code and Codex. You say what you want; the skill writes the loop and registers it. (There is a full CLI underneath if you prefer - see below.)
+- **Local-first and least-privilege.** Every loop declares exactly which tools the agent may use and which directories it may touch. Nothing runs that you did not approve.
+- **Survives sleep.** If your laptop was asleep when a loop was due, `claudecron` runs it once on wake and moves on. One catch-up run, not a storm of missed ticks.
+- **Pure bash + jq.** No runtime, no daemon, MIT licensed. You only pay your own agent usage.
 
 ---
 
-## 60-second quickstart
+## Quickstart - talk to your agent
 
-Install (read the script first, then run it):
+**1. Install (one line - sets up the scheduler and wires the skills into Claude Code + Codex):**
 
 ```sh
-curl -fsSL https://example.com/claudecron/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/awreai/claudecron/main/install.sh | sh
 ```
 
-Add a loop. This registers a job that runs every 15 minutes, scoped to one repo, allowed only to read and run shell:
+**2. Open Claude Code (or Codex) and just say what you want:**
+
+> "Every 15 minutes, look at open PRs on octocat/hello-world and label the ones that need review. Don't merge anything."
+
+The `claudecron` skill takes it from there - it picks a sensible interval, scopes the tools to least privilege, writes a self-contained loop prompt, and registers the loop for you. You can talk to it the same way to manage loops:
+
+> "How are my loops doing?" &nbsp;&rarr;&nbsp; runs the `/claudecron-status` skill
+> "Pause the PR one." &nbsp;&rarr;&nbsp; disables it
+> "Delete the log summarizer and its history." &nbsp;&rarr;&nbsp; removes it
+
+That is the whole experience: **install once, then talk to your agent.** Your loops run on their intervals from then on - even with no terminal open.
+
+### Prefer the CLI? (power users)
+
+Everything the skills do is just the `claudecron` CLI, which is fully standalone (no agent required to drive it):
 
 ```sh
 claudecron add pr-babysitter \
-  --interval 15 \
+  --interval 15m \
   --cwd ~/code/hello-world \
-  --allowed-tools "Bash,Read,Grep" \
-  --prompt "Check open PRs on octocat/hello-world and summarize what needs my review."
+  --tools "Bash,Read,Grep" \
+  --prompt "Check open PRs on octocat/hello-world and label what needs review. Never merge."
+
+claudecron run --now pr-babysitter   # test it immediately, no waiting
+claudecron status                    # dashboard of every loop
+claudecron logs pr-babysitter -f     # follow a loop's output
 ```
 
-Run it once, right now, without waiting for the scheduler:
-
-```sh
-claudecron run --now pr-babysitter
-```
-
-Check what happened:
-
-```sh
-claudecron status
-```
-
-That is the whole loop: **install -> add -> run --now -> status**. When you are happy, enable the OS scheduler (opt-in, see below) and `claudecron` will run your loops on their intervals for you.
+The CLI is the contract; the skills only call into it. Delete every skill and `claudecron` keeps working identically.
 
 ---
 
@@ -181,40 +188,48 @@ The scheduler invokes `claudecron run --wake`, which is the catch-up entrypoint 
 
 ---
 
-## Skills - create loops by talking to your agent
+## The skills and commands
 
-The installer wires `claudecron` into your agent so you can set up and check
-loops in plain language. On install (or `claudecron init`), the skills are
-copied into whichever agents are present:
+The installer wires `claudecron` into whichever agents it finds, so you manage
+everything in plain language. Two skills ship for Claude Code, one prompt for Codex:
 
-- **Claude Code** - `~/.claude/skills/claudecron` and `~/.claude/skills/claudecron-status`
-- **Codex** - `~/.codex/prompts/claudecron.md`
+| Where | Installed at | What it does |
+|-------|--------------|--------------|
+| Claude Code | `~/.claude/skills/claudecron` | Create and manage loops. Triggers on "run X every N minutes", "schedule this", "set up a loop", "stop/delete the X loop". |
+| Claude Code | `~/.claude/skills/claudecron-status` | The `/claudecron-status` command - a quick read-only progress check. Triggers on "how are my loops doing", "did X run", "when is X next due". |
+| Codex | `~/.codex/prompts/claudecron.md` | The same create-and-manage flow, defaulting to the `codex` backend. |
 
-Then you can just say:
+**Create a loop** - describe the job, the agent does the rest:
 
-> "Every 15 minutes, triage new PRs on octocat/hello-world and label them - never merge."
+> "Watch package.json for outdated dependencies once a day and write a summary to DEPENDENCY_UPDATES.md."
 
-and the agent gathers the details, writes a self-contained loop prompt, and runs
-`claudecron add ...` for you. To check on things:
+The skill picks the interval, scopes tools to least privilege, writes a
+self-contained loop prompt (with a cursor and a silence-when-nothing-changed
+rule), and registers it.
 
-> `/claudecron-status` &nbsp;-&nbsp; or just &nbsp; "how are my loops doing?"
+**Check progress** - type the command or just ask:
 
-which runs `claudecron status` and summarizes what is scheduled, what last ran,
-and what is due next.
+> `/claudecron-status` &nbsp; or &nbsp; "how are my loops doing?"
 
-Manage the integration directly with:
+summarizes what is scheduled, what last ran, anything that errored, and what is due next.
+
+**Manage** - all conversational:
+
+> "Pause the dependency watcher." &rarr; disables it
+> "Run the PR triage right now." &rarr; runs it once immediately
+> "Delete the log summarizer and its history." &rarr; removes it with state
+
+You can also drive the integration directly:
 
 ```sh
-claudecron skills install   # wire into Claude Code + Codex (run by init)
-claudecron skills status     # show where skills are installed
-claudecron skills remove     # unwire (also done by 'claudecron uninstall')
+claudecron skills install   # wire into Claude Code + Codex (init does this for you)
+claudecron skills status    # show where the skills are installed
+claudecron skills remove    # unwire (claudecron uninstall does this too)
 ```
 
-**The CLI is fully standalone.** Skills are convenience wrappers on top of it,
-never a dependency. Every loop can be created and managed with `claudecron add` /
-`run` / `status` and a registry you edit by hand. Delete every skill and
-`claudecron` keeps working identically - the CLI is the contract. Skip the
-integration entirely with `claudecron init --no-skills`.
+**The CLI is the contract; skills only call into it.** Everything above maps to a
+`claudecron` command, the CLI is fully standalone, and you can skip the skills
+entirely with `claudecron init --no-skills`.
 
 ---
 
