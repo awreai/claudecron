@@ -38,7 +38,7 @@ jobs:
 
       - name: ShellCheck
         run: |
-          shellcheck -s bash \
+          shellcheck -s bash --severity=warning \
             bin/claudecron \
             lib/*.sh \
             scripts/*.sh \

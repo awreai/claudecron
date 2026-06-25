@@ -149,6 +149,9 @@ stage_tree() {
   cp -R "$_src/bin" "$LIBEXEC/bin"
   cp -R "$_src/lib" "$LIBEXEC/lib"
   cp -R "$_src/templates" "$LIBEXEC/templates"
+  # Ship the agent skills so 'claudecron skills install' can wire Claude Code
+  # and Codex. Optional: absence is non-fatal (the CLI works standalone).
+  [ -d "$_src/skills" ] && cp -R "$_src/skills" "$LIBEXEC/skills"
 
   if [ -f "$_src/VERSION" ]; then
     cp "$_src/VERSION" "$LIBEXEC/VERSION"
@@ -239,7 +242,7 @@ main() {
   # SAFE local-dir fallback: if run from a checkout that already has a built
   # tree (./bin/claudecron), stage from there instead of downloading. Lets the
   # installer be exercised offline / in tests with no network and no real release.
-  _self_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+  _self_dir="$(unset CDPATH; cd -- "$(dirname -- "$0")" && pwd)"
   if [ -x "$_self_dir/bin/claudecron" ] && [ -d "$_self_dir/lib" ] && [ -d "$_self_dir/templates" ]; then
     info "Local checkout detected at ${_self_dir}; staging from there (offline mode)"
     stage_tree "$_self_dir"
