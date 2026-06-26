@@ -202,6 +202,29 @@ _cmd="${_CC_REST[0]}"
 set -- ${_CC_REST[@]+"${_CC_REST[@]}"}
 shift
 
+# _cc_seed_self_improve - register the built-in self-improve loop if absent.
+# Idempotent: leaves an existing entry untouched. Copies the shipped builtin
+# prompt into the data dir so upgrades can refresh it.
+_cc_seed_self_improve() {
+  if loop_exists self-improve; then
+    cc_log info "self-improve loop already present; leaving as is"
+    return 0
+  fi
+  local src="$CLAUDECRON_LIBEXEC/builtins/self-improve.prompt.md"
+  if [ ! -f "$src" ]; then
+    cc_log warn "builtin self-improve prompt not found at $src; skipping seed"
+    return 0
+  fi
+  mkdir -p "$CLAUDECRON_HOME/prompts"
+  cp "$src" "$CLAUDECRON_HOME/prompts/self-improve.md"
+  cc_jq -n \
+    '{ id: "self-improve", enabled: true, interval_minutes: 2880,
+       cwd: env.HOME, add_dirs: [], allowed_tools: "Bash,Read,Write",
+       prompt_file: "prompts/self-improve.md", backend: "claude" }' \
+    | loop_upsert self-improve
+  cc_log info "seeded built-in self-improve loop (every 2 days)"
+}
+
 # ===========================================================================
 # init
 # ===========================================================================
@@ -251,6 +274,7 @@ EOF
   fi
 
   loop_registry_init
+  _cc_seed_self_improve
 
   if [ "$no_scheduler" -eq 1 ]; then
     cc_log info "skipping scheduler install (--no-scheduler)"
