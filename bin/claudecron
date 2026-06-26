@@ -319,29 +319,33 @@ cmd_add() {
   local interactive=1
   # add_dirs collected as a repeatable flag.
   local add_dirs=()
+  # Sentinels: track which fields the user explicitly provided.
+  local _set_interval=0 _set_cwd=0 _set_tools=0 _set_backend=0 _set_enabled=0 _set_add_dirs=0
+  # Notify temp vars (must be local to avoid leaking into caller scope).
+  local n_kind="" n_target="" n_tool="" n_block=""
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --interval)
         [ "$#" -ge 2 ] || cc_die "--interval requires minutes"
-        interval="$2"; interactive=0; shift 2 ;;
-      --interval=*) interval="${1#*=}"; interactive=0; shift ;;
+        interval="$2"; _set_interval=1; interactive=0; shift 2 ;;
+      --interval=*) interval="${1#*=}"; _set_interval=1; interactive=0; shift ;;
       --cwd)
         [ "$#" -ge 2 ] || cc_die "--cwd requires a path"
-        cwd="$2"; interactive=0; shift 2 ;;
-      --cwd=*) cwd="${1#*=}"; interactive=0; shift ;;
+        cwd="$2"; _set_cwd=1; interactive=0; shift 2 ;;
+      --cwd=*) cwd="${1#*=}"; _set_cwd=1; interactive=0; shift ;;
       --add-dir)
         [ "$#" -ge 2 ] || cc_die "--add-dir requires a path"
-        add_dirs[${#add_dirs[@]}]="$2"; interactive=0; shift 2 ;;
-      --add-dir=*) add_dirs[${#add_dirs[@]}]="${1#*=}"; interactive=0; shift ;;
+        add_dirs[${#add_dirs[@]}]="$2"; _set_add_dirs=1; interactive=0; shift 2 ;;
+      --add-dir=*) add_dirs[${#add_dirs[@]}]="${1#*=}"; _set_add_dirs=1; interactive=0; shift ;;
       --tools)
         [ "$#" -ge 2 ] || cc_die "--tools requires a comma list"
-        tools="$2"; interactive=0; shift 2 ;;
-      --tools=*) tools="${1#*=}"; interactive=0; shift ;;
+        tools="$2"; _set_tools=1; interactive=0; shift 2 ;;
+      --tools=*) tools="${1#*=}"; _set_tools=1; interactive=0; shift ;;
       --backend)
         [ "$#" -ge 2 ] || cc_die "--backend requires a value"
-        backend="$2"; interactive=0; shift 2 ;;
-      --backend=*) backend="${1#*=}"; interactive=0; shift ;;
+        backend="$2"; _set_backend=1; interactive=0; shift 2 ;;
+      --backend=*) backend="${1#*=}"; _set_backend=1; interactive=0; shift ;;
       --prompt)
         [ "$#" -ge 2 ] || cc_die "--prompt requires text"
         prompt_inline="$2"; interactive=0; shift 2 ;;
@@ -351,8 +355,8 @@ cmd_add() {
         prompt_file_src="$2"; interactive=0; shift 2 ;;
       --prompt-file=*) prompt_file_src="${1#*=}"; interactive=0; shift ;;
       -)  prompt_from_stdin=1; interactive=0; shift ;;
-      --enabled)  enabled="true";  interactive=0; shift ;;
-      --disabled) enabled="false"; interactive=0; shift ;;
+      --enabled)  enabled="true";  _set_enabled=1; interactive=0; shift ;;
+      --disabled) enabled="false"; _set_enabled=1; interactive=0; shift ;;
       --force)    force=1; shift ;;
       -h|--help)
         cat <<EOF
@@ -395,6 +399,12 @@ EOF
     cc_die "loop '$id' already exists; pass --force to overwrite"
   fi
 
+  # Load existing entry (if any) so non-provided fields can be preserved.
+  local _existing=""
+  if loop_get "$id" >/dev/null 2>&1; then
+    _existing="$(loop_get "$id")"
+  fi
+
   # Interactive path: bare invocation with no scripting flags.
   if [ "$interactive" -eq 1 ]; then
     _cc_add_interactive_collect
@@ -402,7 +412,14 @@ EOF
     #   add_dirs[] enabled prompt_inline
   fi
 
-  # Defaults for anything still unset.
+  # Defaults for anything still unset. When re-adding an existing loop and the
+  # user did NOT provide a field, preserve the existing value instead of
+  # resetting to the global default.
+
+  # interval
+  if [ "$_set_interval" -eq 0 ] && [ -n "$_existing" ]; then
+    interval="$(printf '%s' "$_existing" | cc_jq -r '.interval_minutes // 15')"
+  fi
   [ -n "$interval" ] || interval=15
   # Accept friendly forms (15, 15m, 2h) via the shared parser, which normalizes
   # to integer minutes and rejects sub-minute values.
@@ -410,6 +427,10 @@ EOF
     || cc_die "add: --interval must be a positive duration like 15, 15m, or 2h"
   [ "$interval" -ge 1 ] || cc_die "add: --interval must be >= 1 minute"
 
+  # cwd
+  if [ "$_set_cwd" -eq 0 ] && [ -n "$_existing" ]; then
+    cwd="$(printf '%s' "$_existing" | cc_jq -r '.cwd // ""')"
+  fi
   if [ -z "$cwd" ]; then
     cwd="$PWD"
     cc_log warn "no --cwd given; defaulting to $cwd"
@@ -420,6 +441,17 @@ EOF
   esac
   [ -d "$cwd" ] || cc_log warn "cwd does not exist yet: $cwd"
 
+  # add_dirs: preserve from existing entry when the user did not pass --add-dir.
+  if [ "$_set_add_dirs" -eq 0 ] && [ -n "$_existing" ]; then
+    local _d
+    while IFS= read -r _d; do
+      [ -n "$_d" ] || continue
+      add_dirs[${#add_dirs[@]}]="$_d"
+    done <<ENDDIRS
+$(printf '%s' "$_existing" | cc_jq -r '(.add_dirs // [])[]')
+ENDDIRS
+  fi
+
   # Validate add_dirs are absolute.
   local d
   for d in ${add_dirs[@]+"${add_dirs[@]}"}; do
@@ -429,8 +461,16 @@ EOF
     esac
   done
 
+  # tools
+  if [ "$_set_tools" -eq 0 ] && [ -n "$_existing" ]; then
+    tools="$(printf '%s' "$_existing" | cc_jq -r '.allowed_tools // ""')"
+  fi
   [ -n "$tools" ] || tools="Bash,Read,Write,Edit"
 
+  # backend
+  if [ "$_set_backend" -eq 0 ] && [ -n "$_existing" ]; then
+    backend="$(printf '%s' "$_existing" | cc_jq -r '.backend // ""')"
+  fi
   if [ -z "$backend" ]; then
     backend="$(cfg_get backend)"
     [ -n "$backend" ] || backend="claude"
@@ -439,6 +479,11 @@ EOF
     claude|codex) : ;;
     *) cc_die "add: backend must be 'claude' or 'codex' (got '$backend')" ;;
   esac
+
+  # enabled
+  if [ "$_set_enabled" -eq 0 ] && [ -n "$_existing" ]; then
+    enabled="$(printf '%s' "$_existing" | cc_jq -r '.enabled // true')"
+  fi
 
   # Resolve the prompt content from exactly one source.
   local prompt_content=""
@@ -872,6 +917,7 @@ EOF
   if [ -n "$only_id" ]; then
     loop_exists "$only_id" || cc_die "improve: no such loop '$only_id'"
     cc_log info "improve focus: $only_id"
+    export CLAUDECRON_IMPROVE_FOCUS="$only_id"
   fi
 
   if [ "$dry" -eq 1 ]; then
