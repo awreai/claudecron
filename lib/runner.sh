@@ -198,12 +198,10 @@ runner__run_one() {
     # a saved param string is unsafe with spaces; instead use a function that
     # reads them via 'set --' from a subshell-safe construct.
     runner__exec_with_adddirs "$ro__backend" "$ro__prompt" "$ro__tools" "$ro__cwd" "$ro__adddirs" \
-      >> "$ro__loop_log" 2>&1
-    ro__rc=$?
+      >> "$ro__loop_log" 2>&1 || ro__rc=$?
   else
     cc_backend_exec "$ro__backend" "$ro__prompt" "$ro__tools" "$ro__cwd" \
-      >> "$ro__loop_log" 2>&1
-    ro__rc=$?
+      >> "$ro__loop_log" 2>&1 || ro__rc=$?
   fi
 
   ro__end="$(epoch_now)"
