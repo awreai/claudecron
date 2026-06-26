@@ -115,6 +115,7 @@ Commands:
   list                 List loop ids (terse).
   status               Dashboard table of all loops.
   run                  Run one due pass (same path the scheduler takes).
+  improve              Run a self-improve pass now (audit + improve prompts).
   logs <id>            Tail a loop's log (or the runner log with --runner).
   enable <id>          Enable a loop (or the scheduler with --scheduler).
   disable <id>         Disable a loop (or the scheduler with --scheduler).
@@ -760,6 +761,51 @@ EOF
 }
 
 # ===========================================================================
+# improve - run one self-improve pass now (audits + improves loop prompts).
+# ===========================================================================
+cmd_improve() {
+  local only_id=""
+  local dry=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --id)
+        [ "$#" -ge 2 ] || cc_die "--id requires a loop id"
+        only_id="$2"; shift 2 ;;
+      --id=*) only_id="${1#*=}"; shift ;;
+      --dry-run) dry=1; shift ;;
+      -h|--help)
+        cat <<EOF
+Usage: claudecron improve [--id <loop>] [--dry-run]
+
+  Run one self-improve pass now: audit loop prompts + run logs and improve
+  the prompts (backup + validation gated). Same pass the scheduled
+  self-improve loop runs.
+
+  --id <loop>   Focus the audit on one loop (still runs the self-improve pass).
+  --dry-run     Show what would run without invoking the backend.
+EOF
+        return 0 ;;
+      -*) cc_die "improve: unknown option: $1" ;;
+      *) cc_die "improve: unexpected argument: $1" ;;
+    esac
+  done
+
+  loop_exists self-improve \
+    || cc_die "no self-improve loop; run 'claudecron init' to seed it"
+
+  if [ -n "$only_id" ]; then
+    loop_exists "$only_id" || cc_die "improve: no such loop '$only_id'"
+    cc_log info "improve focus: $only_id"
+  fi
+
+  if [ "$dry" -eq 1 ]; then
+    cmd_run --now self-improve --dry-run
+  else
+    cmd_run --now self-improve
+  fi
+}
+
+# ===========================================================================
 # logs
 # ===========================================================================
 cmd_logs() {
@@ -1148,6 +1194,7 @@ case "$_cmd" in
   list|ls)    cmd_list       ${@+"$@"} ;;
   status|st)  cmd_status     ${@+"$@"} ;;
   run)        cmd_run        ${@+"$@"} ;;
+  improve)    cmd_improve    ${@+"$@"} ;;
   logs|log)   cmd_logs       ${@+"$@"} ;;
   enable)     cmd_enable     ${@+"$@"} ;;
   disable)    cmd_disable    ${@+"$@"} ;;
