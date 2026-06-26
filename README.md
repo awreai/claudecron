@@ -88,6 +88,8 @@ The CLI is the contract; the skills only call into it. Delete every skill and `c
 
 The runner takes a single mutex via `mkdir` so two wakes can never overlap. Each loop has its own log; the runner has its own log; state is written per host so one registry can drive several machines independently.
 
+When multiple loops are due on the same wake, the runner executes them as bounded concurrent processes rather than serially. Each due loop runs in its own process behind a per-loop lock, with the number of simultaneous processes capped by the `max_parallel` config setting (default 4). A slow loop does not block others from starting.
+
 ### Catch-up on wake (the sleep story)
 
 Real laptops sleep. A loop due every 15 minutes will miss ticks while the lid is closed. `claudecron` does not try to replay every missed tick. Each loop's state file holds a **cursor** - the last time it ran. On wake, a loop is "due" if more than its interval has elapsed since the cursor. If it is due, it runs **once** and the cursor jumps to now.
@@ -108,6 +110,48 @@ So: laptop sleeps for six hours, wakes, your 15-minute loop runs exactly once, a
 The backend binary is auto-detected, or you can pin it with `claude_bin` / `codex_bin` in `config.json`.
 
 **Test seam.** Set `CLAUDECRON_TEST_BACKEND_CMD` and `claudecron` runs that command instead of a real backend. This lets you smoke-test scheduling, locking, state, and logging end to end without spending a single token. CI uses exactly this.
+
+---
+
+## Notifications
+
+claudecron does not send messages itself. A loop notifies you by calling a tool
+in its `allowed_tools` - for example a Slack tool exposed to the agent, or
+`Bash` running `curl` against a webhook. The channel or target lives in the
+loop's prompt, so notifications are as flexible as your agent's tools.
+
+### Slack
+
+Two common ways a loop reaches Slack:
+
+- Agent Slack tool: if your backend agent has a Slack tool (e.g. an MCP Slack
+  server), add that tool to the loop's `allowed_tools` and put the channel id in
+  the prompt. The loop calls the tool to post.
+- Webhook: add `Bash` to the loop and have the prompt `curl -X POST` a Slack
+  incoming-webhook URL with a JSON `{"text": "..."}` body.
+
+### Guided setup and test send
+
+When you create a loop interactively (`claudecron add <id>` with no flags),
+claudecron asks how the loop should notify you - slack, webhook, command, or
+none - records the target, and sends a real test notification so you can confirm
+it lands before the loop ever runs unattended. If the test does not arrive, fix
+the channel and re-run `add`.
+
+### Overriding the channel
+
+The comm channel is overridable at three levels:
+
+1. Per loop: edit the channel id or URL in the loop's prompt, or re-run
+   `claudecron add <id>` and answer the notify step again.
+2. Default for new loops: the `notify` block in `config.json`
+   (`{ "kind": "...", "target": "...", "tool": "..." }`) prefills the answers
+   for future loops.
+3. Per environment: have the prompt read an environment variable for the
+   channel id, so the same loop targets different channels on different machines.
+
+Loop files (prompts, cursors, backups, logs) always live under the claudecron
+home, never in the repository a loop operates on.
 
 ---
 
@@ -162,8 +206,10 @@ Each loop in `registry.json` looks like this:
   "backend": "claude",
   "lock_stale_minutes": 30,
   "log_keep_lines": 500,
+  "max_parallel": 4,
   "claude_bin": "",
-  "codex_bin": ""
+  "codex_bin": "",
+  "notify": { "kind": "none", "target": "", "tool": "" }
 }
 ```
 
@@ -218,6 +264,19 @@ summarizes what is scheduled, what last ran, anything that errored, and what is 
 > "Pause the dependency watcher." &rarr; disables it
 > "Run the PR triage right now." &rarr; runs it once immediately
 > "Delete the log summarizer and its history." &rarr; removes it with state
+
+**Improve** - run the built-in self-improve loop on demand:
+
+```sh
+claudecron improve              # audit and improve all loop prompts now
+claudecron improve --id <id>    # focus the audit on one loop
+claudecron improve --dry-run    # show what would run, no tokens spent
+```
+
+The `self-improve` loop is seeded automatically on `claudecron init` (it also
+runs every 2 days on its own schedule). It audits your loop prompts against the
+five laws (cold-start, silence, cursor-not-clock, state-split, idempotency),
+rewrites any that drift, and backs up the original before applying.
 
 You can also drive the integration directly:
 

@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Built-in self-improve loop: seeded on init (every 2 days), audits and improves
+  loop prompts with backup + five-laws validation; run on demand with
+  `claudecron improve`.
+- Interactive notification setup in `add` with an end-to-end test send; new
+  `notify` config block; README "Notifications" section documenting Slack and
+  channel overrides.
+- `claudecron improve [--id <id>] [--dry-run]` subcommand to trigger a
+  self-improve pass on demand without waiting for the scheduled run.
+- Concurrent loop execution: due loops now run as bounded parallel processes
+  (capped by `max_parallel`, default 4) so a slow loop does not delay others.
+- Slack notification support: loops can notify via an agent Slack tool or via
+  `Bash` + `curl` to a webhook; guided setup in `add` records the target and
+  sends a test message to confirm delivery.
+
 ### Changed
 
 ### Fixed
