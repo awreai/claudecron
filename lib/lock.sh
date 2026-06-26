@@ -127,3 +127,45 @@ lock_acquire() {
   unset la__stale_min la__stale_sec la__mtime la__now la__age
   exit 0
 }
+
+# loop_lock_acquire <id> - per-loop mutual exclusion. Returns 0 if acquired,
+# 1 if another live process holds it (caller should skip this loop). Steals a
+# stale per-loop lock (older than lock_stale_minutes) first. Never exits.
+loop_lock_acquire() {
+  lla__id="$1"
+  lla__dir="$CLAUDECRON_LOCK_DIR/$lla__id"
+  mkdir -p "$CLAUDECRON_LOCK_DIR" 2>/dev/null || true
+  if mkdir "$lla__dir" 2>/dev/null; then
+    printf '%s\n' "$$" > "$lla__dir/pid" 2>/dev/null || true
+    unset lla__id lla__dir
+    return 0
+  fi
+  lla__stale_min="$(cfg_get lock_stale_minutes 30)"
+  case "$lla__stale_min" in ''|*[!0-9]* ) lla__stale_min=30 ;; esac
+  lla__stale_sec=$(( lla__stale_min * 60 ))
+  lla__mtime="$(lock__mtime_epoch "$lla__dir")"
+  lla__now="$(lock__now_epoch)"
+  if [ -n "$lla__mtime" ] && [ -n "$lla__now" ]; then
+    lla__age=$(( lla__now - lla__mtime ))
+    if [ "$lla__age" -ge "$lla__stale_sec" ]; then
+      cc_log "stealing stale loop lock for '$lla__id' (age ${lla__age}s)"
+      rm -rf "$lla__dir" 2>/dev/null || true
+      if mkdir "$lla__dir" 2>/dev/null; then
+        printf '%s\n' "$$" > "$lla__dir/pid" 2>/dev/null || true
+        unset lla__id lla__dir lla__stale_min lla__stale_sec lla__mtime lla__now lla__age
+        return 0
+      fi
+    fi
+  fi
+  cc_log "loop '$lla__id' already running; skipping"
+  unset lla__id lla__dir lla__stale_min lla__stale_sec lla__mtime lla__now lla__age
+  return 1
+}
+
+# loop_lock_release <id> - release a per-loop lock.
+loop_lock_release() {
+  llr__dir="$CLAUDECRON_LOCK_DIR/$1"
+  rmdir "$llr__dir" 2>/dev/null || rm -rf "$llr__dir" 2>/dev/null || true
+  unset llr__dir
+  return 0
+}

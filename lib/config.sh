@@ -49,7 +49,7 @@ config_default_json() {
     --arg backend "$CLAUDECRON_DEFAULT_BACKEND" \
     --argjson lock_stale "$CLAUDECRON_DEFAULT_LOCK_STALE_MINUTES" \
     --argjson log_keep "$CLAUDECRON_DEFAULT_LOG_KEEP_LINES" \
-    '{ backend: $backend, lock_stale_minutes: $lock_stale, log_keep_lines: $log_keep, claude_bin: "", codex_bin: "" }'
+    '{ backend: $backend, lock_stale_minutes: $lock_stale, log_keep_lines: $log_keep, claude_bin: "", codex_bin: "", max_parallel: 4 }'
 }
 
 # config_ensure - create config.json with defaults if it does not exist.
