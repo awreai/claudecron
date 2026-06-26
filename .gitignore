@@ -13,4 +13,5 @@ lock/
 .serena/
 .superpowers/
 .claude/
+.worktrees/
 .DS_Store
