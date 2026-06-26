@@ -155,10 +155,19 @@ runner__run_one() {
     return 0
   fi
 
+  # Per-loop mutual exclusion: skip if this loop is already running elsewhere.
+  if [ "$ro__dry" != "1" ]; then
+    if ! loop_lock_acquire "$ro__id"; then
+      unset ro__json ro__force ro__dry ro__log_keep ro__id ro__enabled ro__interval ro__cwd ro__tools ro__prompt_file ro__backend ro__adddirs ro__prompt_path ro__loop_log ro__last ro__is_due
+      return 0
+    fi
+  fi
+
   # Read the prompt.
   if [ ! -r "$ro__prompt_path" ]; then
     runner__log "status id=$ro__id result=error reason=prompt-missing path=$ro__prompt_path"
     state_record_run "$ro__id" error 0
+    loop_lock_release "$ro__id"
     unset ro__json ro__force ro__dry ro__log_keep ro__id ro__enabled ro__interval ro__cwd ro__tools ro__prompt_file ro__backend ro__adddirs ro__prompt_path ro__loop_log ro__last ro__is_due
     return 0
   fi
@@ -211,6 +220,8 @@ runner__run_one() {
     runner__log "status id=$ro__id result=error rc=$ro__rc dur=${ro__dur}s"
   fi
 
+  loop_lock_release "$ro__id"
+
   unset ro__json ro__force ro__dry ro__log_keep ro__id ro__enabled ro__interval ro__cwd ro__tools ro__prompt_file ro__backend ro__adddirs ro__prompt_path ro__loop_log ro__last ro__is_due ro__prompt ro__start ro__end ro__dur ro__rc
   return 0
 }
@@ -258,12 +269,6 @@ cc_run() {
     esac
   done
 
-  # Lock first (quiet exit 0 if another runner holds it). Skip locking for a
-  # pure dry-run so it never blocks on / steals an active run's lock.
-  if [ "$cr__dry" != "1" ]; then
-    lock_acquire
-  fi
-
   cc_mkdirs
   registry_ensure
   config_ensure
@@ -277,9 +282,14 @@ cc_run() {
     runner__log "wake source=cli host=$CLAUDECRON_HOST"
   fi
 
+  cr__max="$(cfg_get max_parallel 4)"
+  case "$cr__max" in ''|*[!0-9]* ) cr__max=4 ;; esac
+  [ "$cr__max" -ge 1 ] || cr__max=1
+
   # Iterate loops with portable while-read. Each loop entry is emitted as a
   # single compact JSON line by jq -c; we read line by line (no mapfile).
   cr__count=0
+  cr__running=0
   while IFS= read -r cr__entry; do
     [ -n "$cr__entry" ] || continue
     if [ -n "$cr__only_id" ]; then
@@ -287,16 +297,30 @@ cc_run() {
       [ "$cr__this_id" = "$cr__only_id" ] || continue
     fi
     cr__count=$(( cr__count + 1 ))
-    runner__run_one "$cr__entry" "$cr__force" "$cr__dry" "$cr__log_keep"
+    if [ "$cr__dry" = "1" ]; then
+      # Dry-run stays serial and lock-free for deterministic output.
+      runner__run_one "$cr__entry" "$cr__force" "$cr__dry" "$cr__log_keep"
+    else
+      runner__run_one "$cr__entry" "$cr__force" "$cr__dry" "$cr__log_keep" &
+      cr__running=$(( cr__running + 1 ))
+      if [ "$cr__running" -ge "$cr__max" ]; then
+        wait
+        cr__running=0
+      fi
+    fi
   done <<EOF
 $(registry_read | cc_jq -c '.loops[]')
 EOF
+  # Drain any remaining background loop processes.
+  if [ "$cr__dry" != "1" ]; then
+    wait
+  fi
 
   if [ -n "$cr__only_id" ] && [ "$cr__count" -eq 0 ]; then
     cc_err "no loop with id '$cr__only_id' in registry"
   fi
 
   runner__log "wake done host=$CLAUDECRON_HOST processed=$cr__count"
-  unset cr__dry cr__force cr__only_id cr__wake cr__log_keep cr__count cr__entry cr__this_id
+  unset cr__dry cr__force cr__only_id cr__wake cr__log_keep cr__count cr__entry cr__this_id cr__max cr__running
   return 0
 }
