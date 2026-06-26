@@ -171,6 +171,8 @@ runner__run_one() {
   if [ ! -r "$ro__prompt_path" ]; then
     runner__log "status id=$ro__id result=error reason=prompt-missing path=$ro__prompt_path"
     state_record_run "$ro__id" error 0
+    # Explicit release for bash 3.2: EXIT trap only fires on set -e abort, not normal return.
+    loop_lock_release "$ro__id"
     unset ro__json ro__force ro__dry ro__log_keep ro__id ro__enabled ro__interval ro__cwd ro__tools ro__prompt_file ro__backend ro__adddirs ro__prompt_path ro__loop_log ro__last ro__is_due
     return 0
   fi
@@ -223,7 +225,9 @@ runner__run_one() {
     runner__log "status id=$ro__id result=error rc=$ro__rc dur=${ro__dur}s"
   fi
 
-  # The EXIT trap installed after loop_lock_acquire releases the lock on exit.
+  # Explicit release for bash 3.2: EXIT trap only fires on set -e abort, not normal return.
+  # loop_lock_release is an idempotent rmdir so double-release (here + trap) is harmless.
+  loop_lock_release "$ro__id"
   unset ro__json ro__force ro__dry ro__log_keep ro__id ro__enabled ro__interval ro__cwd ro__tools ro__prompt_file ro__backend ro__adddirs ro__prompt_path ro__loop_log ro__last ro__is_due ro__prompt ro__start ro__end ro__dur ro__rc
   return 0
 }
