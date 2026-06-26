@@ -136,6 +136,7 @@ or systemd units yourself.
 | "change X to every N min" / edit cwd/tools/prompt | `claudecron add <id> ...` again with the new flags (re-add updates) |
 | "show me X's output / logs" | `claudecron logs <id>` |
 | "delete X" / "remove X for good" | `claudecron remove <id> --purge --yes` |
+| "audit/improve my loops" / "make loops better" | `claudecron improve [--id <id>] [--dry-run]` (the self-improve loop is seeded by default and also runs every 2 days) |
 
 Parse `claudecron status --json` to answer "how is X" - it carries each loop's
 enabled flag, interval, last_run, last_status, and last_duration_s. Read those
