@@ -770,8 +770,13 @@ cmd_improve() {
     case "$1" in
       --id)
         [ "$#" -ge 2 ] || cc_die "--id requires a loop id"
+        case "$2" in
+          -*|'') cc_die "--id requires a loop id, got '$2'" ;;
+        esac
         only_id="$2"; shift 2 ;;
-      --id=*) only_id="${1#*=}"; shift ;;
+      --id=*) only_id="${1#*=}"
+        [ -n "$only_id" ] || cc_die "--id requires a loop id"
+        shift ;;
       --dry-run) dry=1; shift ;;
       -h|--help)
         cat <<EOF
