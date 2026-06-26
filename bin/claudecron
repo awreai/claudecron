@@ -463,6 +463,44 @@ EOF
     cc_die "add: empty prompt; provide --prompt, --prompt-file, or - (stdin)"
   fi
 
+  # Interactive notify setup (only in the interactive path; scripted add skips).
+  if [ "$interactive" = "1" ]; then
+    _cc_ask "Notify how on activity? (slack/webhook/command/none)" "$(notify_get kind none)"
+    n_kind="$_cc_reply"
+    case "$n_kind" in
+      slack)
+        _cc_ask "Slack channel id" "$(notify_get target)"; n_target="$_cc_reply"
+        _cc_ask "Slack tool name (agent tool that sends)" "$(notify_get tool)"; n_tool="$_cc_reply"
+        ;;
+      webhook)
+        _cc_ask "Webhook URL" "$(notify_get target)"; n_target="$_cc_reply"
+        n_tool=""
+        ;;
+      command)
+        _cc_ask "Shell line to run (msg in \$CLAUDECRON_NOTIFY_MSG)" "$(notify_get target)"; n_target="$_cc_reply"
+        n_tool=""
+        ;;
+      *)
+        n_kind="none"; n_target=""; n_tool=""
+        ;;
+    esac
+    n_block="$(cc_jq -n --arg k "$n_kind" --arg t "$n_target" --arg tl "$n_tool" \
+      '{kind:$k, target:$t, tool:$tl}')"
+    cfg_set notify "$n_block"
+    if [ "$n_kind" != "none" ]; then
+      printf 'Sending a test notification...\n'
+      if _cc_notify_test "$n_kind" "$n_target" "$n_tool"; then
+        _cc_ask "Did you receive the test notification? (y/n)" "y"
+        case "$_cc_reply" in
+          y|Y|yes) cc_log info "notify verified end to end" ;;
+          *) cc_log warn "notify NOT confirmed; edit the loop prompt or re-run add to fix the channel" ;;
+        esac
+      else
+        cc_log warn "test send failed; recorded the target anyway - fix and re-run add to verify"
+      fi
+    fi
+  fi
+
   # Write the prompt file under prompts/<id>.md.
   local prompt_rel="prompts/${id}.md"
   local prompt_abs="$CLAUDECRON_HOME/$prompt_rel"
@@ -548,6 +586,39 @@ _cc_ask() {
   _cc_reply="$_r"
 }
 _cc_reply=""
+
+# _cc_notify_test <kind> <target> <tool> - send a one-line test notification.
+# Returns 0 on a successful send attempt, non-zero on failure. The user
+# confirms receipt separately. Supported kinds: slack (via a shell tool/cmd),
+# webhook (curl POST), command (arbitrary shell line), none (no-op).
+_cc_notify_test() {
+  nt__kind="$1"; nt__target="$2"; nt__tool="$3"
+  nt__msg="claudecron test notification - if you see this, notifications work."
+  case "$nt__kind" in
+    none) cc_log info "notify kind=none; nothing to test"; return 0 ;;
+    webhook)
+      command -v curl >/dev/null 2>&1 || { cc_err "curl not found"; return 1; }
+      curl -fsS -X POST -H 'Content-Type: application/json' \
+        --data "$(cc_jq -n --arg t "$nt__msg" '{text:$t}')" \
+        "$nt__target" >/dev/null \
+        || { cc_err "webhook POST failed"; return 1; }
+      return 0 ;;
+    command)
+      [ -n "$nt__target" ] || { cc_err "command notify needs a shell line"; return 1; }
+      CLAUDECRON_NOTIFY_MSG="$nt__msg" sh -c "$nt__target" \
+        || { cc_err "notify command failed"; return 1; }
+      return 0 ;;
+    slack)
+      # Slack is sent by the loop's agent tool at runtime (e.g. an MCP Slack
+      # tool). At setup we cannot call that tool from bash, so we verify the
+      # target shape and tell the user it will be exercised on the first pass.
+      [ -n "$nt__target" ] || { cc_err "slack notify needs a channel id"; return 1; }
+      cc_log info "slack channel recorded: $nt__target (tool: ${nt__tool:-unset})"
+      cc_log info "the loop will send via its Slack tool on its first run"
+      return 0 ;;
+    *) cc_err "unknown notify kind: $nt__kind"; return 1 ;;
+  esac
+}
 
 # Convert a list of dir args into a JSON array string.
 _cc_dirs_to_json() {
