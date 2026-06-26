@@ -15,3 +15,7 @@ lock/
 .claude/
 .worktrees/
 .DS_Store
+
+# Internal SDD docs (design specs + plans) - never shipped to the public repo
+docs/superpowers/
+docs/design/
