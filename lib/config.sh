@@ -49,7 +49,7 @@ config_default_json() {
     --arg backend "$CLAUDECRON_DEFAULT_BACKEND" \
     --argjson lock_stale "$CLAUDECRON_DEFAULT_LOCK_STALE_MINUTES" \
     --argjson log_keep "$CLAUDECRON_DEFAULT_LOG_KEEP_LINES" \
-    '{ backend: $backend, lock_stale_minutes: $lock_stale, log_keep_lines: $log_keep, claude_bin: "", codex_bin: "", max_parallel: 4 }'
+    '{ backend: $backend, lock_stale_minutes: $lock_stale, log_keep_lines: $log_keep, claude_bin: "", codex_bin: "", notify: { kind: "none", target: "", tool: "" }, max_parallel: 4 }'
 }
 
 # config_ensure - create config.json with defaults if it does not exist.
@@ -83,6 +83,19 @@ cfg_get() {
     printf '%s\n' "$cfg__val"
   fi
   unset cfg__key cfg__def cfg__val
+}
+
+# notify_get <field> [default] - print one scalar from the notify config block.
+notify_get() {
+  ng__field="$1"
+  ng__def="${2:-}"
+  ng__val="$(config_read | cc_jq -r --arg f "$ng__field" '.notify[$f] // empty' 2>/dev/null)"
+  if [ -z "$ng__val" ]; then
+    printf '%s\n' "$ng__def"
+  else
+    printf '%s\n' "$ng__val"
+  fi
+  unset ng__field ng__def ng__val
 }
 
 # cfg_set <key> <json-value> - set one config key (value is a JSON literal).
