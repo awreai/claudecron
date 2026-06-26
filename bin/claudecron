@@ -713,22 +713,26 @@ EOF
     CLAUDECRON_BACKEND_OVERRIDE="$backend_override"
     export CLAUDECRON_BACKEND_OVERRIDE
   fi
-  if [ "$dry_run" -eq 1 ]; then
-    CLAUDECRON_DRY_RUN=1
-    export CLAUDECRON_DRY_RUN
-  fi
 
   if [ -n "$force_id" ]; then
     _cc_validate_id "$force_id"
     loop_get "$force_id" >/dev/null 2>&1 || cc_die "run: no such loop '$force_id'"
     cc_log info "forcing run of '$force_id' (ignoring due/enabled)"
-    cc_run --id "$force_id" --force
+    if [ "$dry_run" -eq 1 ]; then
+      cc_run --id "$force_id" --force --dry-run
+    else
+      cc_run --id "$force_id" --force
+    fi
     return $?
   fi
 
   # Bare / --wake: a single due pass over the whole registry.
   cc_log info "starting due pass on $(cc_hostname_s)"
-  cc_run_pass
+  if [ "$dry_run" -eq 1 ]; then
+    cc_run --wake --dry-run
+  else
+    cc_run_pass
+  fi
 }
 
 # ===========================================================================

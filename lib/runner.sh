@@ -161,13 +161,16 @@ runner__run_one() {
       unset ro__json ro__force ro__dry ro__log_keep ro__id ro__enabled ro__interval ro__cwd ro__tools ro__prompt_file ro__backend ro__adddirs ro__prompt_path ro__loop_log ro__last ro__is_due
       return 0
     fi
+    # Guarantee release on every exit path of this subshell, including set -e
+    # aborts triggered by backend errors. The trap fires when the backgrounded
+    # subshell exits for any reason (normal, error, signal).
+    trap 'loop_lock_release "'"$ro__id"'"' EXIT
   fi
 
   # Read the prompt.
   if [ ! -r "$ro__prompt_path" ]; then
     runner__log "status id=$ro__id result=error reason=prompt-missing path=$ro__prompt_path"
     state_record_run "$ro__id" error 0
-    loop_lock_release "$ro__id"
     unset ro__json ro__force ro__dry ro__log_keep ro__id ro__enabled ro__interval ro__cwd ro__tools ro__prompt_file ro__backend ro__adddirs ro__prompt_path ro__loop_log ro__last ro__is_due
     return 0
   fi
@@ -220,8 +223,7 @@ runner__run_one() {
     runner__log "status id=$ro__id result=error rc=$ro__rc dur=${ro__dur}s"
   fi
 
-  loop_lock_release "$ro__id"
-
+  # The EXIT trap installed after loop_lock_acquire releases the lock on exit.
   unset ro__json ro__force ro__dry ro__log_keep ro__id ro__enabled ro__interval ro__cwd ro__tools ro__prompt_file ro__backend ro__adddirs ro__prompt_path ro__loop_log ro__last ro__is_due ro__prompt ro__start ro__end ro__dur ro__rc
   return 0
 }

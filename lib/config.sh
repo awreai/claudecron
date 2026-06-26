@@ -65,8 +65,8 @@ config_ensure() {
 # config_read - emit config.json merged over defaults (fills missing keys).
 config_read() {
   if [ -f "$CLAUDECRON_CONFIG" ]; then
-    config_default_json | cc_jq -s '.[0] * (input // {})' - "$CLAUDECRON_CONFIG" 2>/dev/null \
-      || config_default_json
+    config_default_json | cc_jq -s --slurpfile ovr "$CLAUDECRON_CONFIG" '.[0] * ($ovr[0] // {})' \
+      2>/dev/null || config_default_json
   else
     config_default_json
   fi
