@@ -22,6 +22,12 @@ test -x "$BIN" || { echo "FAIL: $BIN not executable" >&2; exit 1; }
 # 1. init without touching the OS scheduler or the real agent skill dirs
 "$BIN" init --no-scheduler --no-skills
 
+# 1b. init must seed the built-in self-improve loop with its prompt
+"$BIN" list | grep -qx "self-improve" \
+  || { echo "FAIL: init did not seed self-improve loop" >&2; exit 1; }
+test -f "$CLAUDECRON_HOME/prompts/self-improve.md" \
+  || { echo "FAIL: self-improve prompt not copied" >&2; exit 1; }
+
 # 2. register a dummy loop backed by a fake 'echo' backend (test seam)
 export CLAUDECRON_TEST_BACKEND_CMD='echo claudecron-smoke-ran'
 "$BIN" add smoke \
