@@ -23,6 +23,8 @@ If the cursor file does not exist:
 # STEP 1 - FIND WORK
 - Read the cursor. For each loop, recompute its hash. A loop is a CANDIDATE only
   if its hash differs from the cursor (its prompt or behavior changed).
+- If the env var CLAUDECRON_IMPROVE_FOCUS is set, restrict candidates to that
+  loop id only (skip all others regardless of hash change). Print: focus=<id>
 - If there are no candidates: print exactly: noop  and exit. (Silence rule.)
 
 # STEP 2 - AUDIT each candidate (audit yourself LAST and minimally)
