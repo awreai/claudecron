@@ -1,1137 +1,1491 @@
-#!/usr/bin/env bash
+#!/usr/bin/env python3
+# Copyright (c) 2026 The claudecron authors
 #
 # claudecron - schedule and run autonomous agent loops on a fixed cadence.
 #
-# Copyright (c) 2026 The claudecron authors
+# A single-file, standard-library-only Python 3 program. It wakes on a timer
+# (launchd / systemd-user / cron), reads a small JSON registry of "loops", and
+# for each loop that is enabled and due, runs an agent backend (Claude Code or
+# Codex) with that loop's prompt, tools, and working directory.
 #
-# This is the CLI entrypoint. It self-locates its real install path (through
-# any chain of symlinks), discovers its libexec directory (the one containing
-# bin/ lib/ templates/ VERSION), sources the library modules in dependency
-# order, and dispatches subcommands.
+# This replaces the earlier pure-bash implementation. The on-disk formats
+# (registry.json, config.json, per-host state), the CLI surface, the scheduler
+# unit label (dev.claudecron.runner) and its `run --wake` entrypoint, the
+# backend invocation strings, and the runner.log line formats are all identical,
+# so it is a drop-in replacement: existing loops, state files, and the installed
+# timer keep working with no migration.
 #
-# Portability: pure bash that must run under macOS /bin/bash 3.2.
-#   - no mapfile / readarray
-#   - no flock (mkdir is used as the lock mutex inside lib/lock.sh)
-#   - no associative arrays (declare -A)
-#   - every array expansion under `set -u` is guarded as ${arr[@]+"${arr[@]}"}
-#   - BSD date (date -j) vs GNU date (date -d) is detected, not assumed
-#
-set -euo pipefail
+# Zero runtime dependencies beyond python3 itself (macOS and mainstream Linux
+# both ship it). No jq, no third-party packages.
+
+import argparse
+import datetime
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+VERSION_FALLBACK = "0.1.0"
+
+# Loop-level defaults (single source of truth), matching the historical bash
+# constants so registries written by either version are interchangeable.
+DEFAULT_BACKEND = "claude"
+DEFAULT_INTERVAL_MINUTES = 15
+DEFAULT_ALLOWED_TOOLS = "Bash,Read"                  # library default
+ADD_DEFAULT_ALLOWED_TOOLS = "Bash,Read,Write,Edit"   # the `add` command's default
+DEFAULT_LOCK_STALE_MINUTES = 30
+DEFAULT_LOG_KEEP_LINES = 500
+
+SCHED_LABEL = "dev.claudecron.runner"
+
 
 # ---------------------------------------------------------------------------
-# Self-location: resolve this script through symlinks to find the real file,
-# then walk up to the libexec root (the dir holding bin/ lib/ templates/).
-# macOS bash 3.2 has no `readlink -f`, so we follow [ -h ] links by hand.
+# Small utilities
 # ---------------------------------------------------------------------------
-_self_source="${BASH_SOURCE[0]}"
-while [ -h "$_self_source" ]; do
-  _self_dir="$(cd -P "$(dirname "$_self_source")" >/dev/null 2>&1 && pwd)"
-  _self_link="$(readlink "$_self_source")"
-  case "$_self_link" in
-    /*) _self_source="$_self_link" ;;
-    *)  _self_source="$_self_dir/$_self_link" ;;
-  esac
-done
-_self_dir="$(cd -P "$(dirname "$_self_source")" >/dev/null 2>&1 && pwd)"
 
-# bin/ lives directly under the libexec root.
-CLAUDECRON_LIBEXEC="$(cd -P "$_self_dir/.." >/dev/null 2>&1 && pwd)"
-export CLAUDECRON_LIBEXEC
+def now_iso():
+    """Local timestamp like the bash `date '+%Y-%m-%dT%H:%M:%S%z'`."""
+    return datetime.datetime.now().astimezone().strftime("%Y-%m-%dT%H:%M:%S%z")
 
-CLAUDECRON_BIN_DIR="$_self_dir"
-CLAUDECRON_LIB_DIR="$CLAUDECRON_LIBEXEC/lib"
-CLAUDECRON_TEMPLATES_DIR="$CLAUDECRON_LIBEXEC/templates"
-export CLAUDECRON_BIN_DIR CLAUDECRON_LIB_DIR CLAUDECRON_TEMPLATES_DIR
 
-if [ ! -d "$CLAUDECRON_LIB_DIR" ]; then
-  printf 'claudecron: fatal: cannot locate lib/ under %s\n' "$CLAUDECRON_LIBEXEC" >&2
-  printf 'claudecron: the install appears broken; reinstall claudecron.\n' >&2
-  exit 1
-fi
+def epoch_now():
+    return int(time.time())
 
-# Program version (libexec/VERSION). Best-effort; never fatal.
-if [ -f "$CLAUDECRON_LIBEXEC/VERSION" ]; then
-  CLAUDECRON_VERSION="$(cat "$CLAUDECRON_LIBEXEC/VERSION" 2>/dev/null || true)"
-fi
-: "${CLAUDECRON_VERSION:=0.0.0-dev}"
-export CLAUDECRON_VERSION
 
-# CLAUDECRON_PREFIX is the install prefix (libexec/..) when claudecron is
-# installed under <prefix>/share/claudecron. Exported for the scheduler
-# templates so generated units can call the absolute path to this binary.
-CLAUDECRON_PREFIX="${CLAUDECRON_PREFIX:-$CLAUDECRON_LIBEXEC}"
-CLAUDECRON_SELF="$CLAUDECRON_BIN_DIR/claudecron"
-export CLAUDECRON_PREFIX CLAUDECRON_SELF
+def log_stderr(msg):
+    sys.stderr.write("%s [claudecron] %s\n" % (now_iso(), msg))
 
-# ---------------------------------------------------------------------------
-# Source library modules in dependency order. common.sh defines the logging
-# and jq helpers everything else relies on, so it goes first.
-# ---------------------------------------------------------------------------
-_cc_source() {
-  # $1 = lib basename. Fail loudly if a required module is missing.
-  local _f="$CLAUDECRON_LIB_DIR/$1"
-  if [ ! -f "$_f" ]; then
-    printf 'claudecron: fatal: missing library %s\n' "$_f" >&2
-    exit 1
-  fi
-  # shellcheck source=/dev/null
-  . "$_f"
-}
 
-_cc_source common.sh
-_cc_source config.sh
-_cc_source state.sh
-_cc_source lock.sh
-_cc_source due.sh
-_cc_source backend.sh
-_cc_source runner.sh
-_cc_source scheduler.sh
-_cc_source skills.sh
-_cc_source compat.sh
+def die(msg, code=1):
+    sys.stderr.write("%s [claudecron] ERROR: %s\n" % (now_iso(), msg))
+    sys.exit(code)
 
-# ---------------------------------------------------------------------------
-# Global flags. Parsed before the subcommand so that `--config DIR`, `--json`,
-# `-q`/`-v` can appear anywhere up front. The first non-flag token is the
-# subcommand; everything after it is passed through untouched.
-# ---------------------------------------------------------------------------
-CC_JSON=0          # global --json: machine-readable output where supported
-CC_VERBOSITY=1     # 0 quiet, 1 normal, 2 verbose
-CC_CONFIG_OVERRIDE=""
-export CC_JSON CC_VERBOSITY
 
-_cc_global_args=""
+def atomic_write(dest, text):
+    """Write text to dest atomically (temp file in the same dir + rename)."""
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(dest.parent), prefix=dest.name + ".tmp.")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        os.replace(tmp, str(dest))
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
-usage() {
-  cat <<EOF
-claudecron $CLAUDECRON_VERSION - run autonomous agent loops on a schedule
 
-Usage:
-  claudecron <command> [options]
+def write_json(dest, obj):
+    atomic_write(dest, json.dumps(obj, indent=2) + "\n")
 
-Commands:
-  init                 Create the data dir, write default config + registry,
-                       and install the scheduler.
-  add <id>             Add a loop. Bare = interactive; flags = scripted.
-  list                 List loop ids (terse).
-  status               Dashboard table of all loops.
-  run                  Run one due pass (same path the scheduler takes).
-  logs <id>            Tail a loop's log (or the runner log with --runner).
-  enable <id>          Enable a loop (or the scheduler with --scheduler).
-  disable <id>         Disable a loop (or the scheduler with --scheduler).
-  remove <id>          Remove a loop entry.
-  doctor               Preflight checks; non-zero on any failure.
-  scheduler <action>   install | remove | status.
-  skills <action>      install | remove | status (Claude Code + Codex).
-  uninstall            Remove the scheduler + skills (and data with --purge).
-  version              Print the claudecron version.
-  help                 Show this help.
 
-Global options:
-  --json               Machine-readable output where supported.
-  --config <dir>       Use <dir> as CLAUDECRON_HOME for this invocation.
-  -q, --quiet          Less output.
-  -v, --verbose        More output.
+def load_json(path, default):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return default
 
-Examples:
-  claudecron init --backend claude
-  claudecron add pr-babysitter --interval 15 --cwd "\$HOME/src/hello-world" \\
-      --tools "Bash,Read,Write" --prompt-file ./pr.md
-  claudecron run --now pr-babysitter
-  claudecron status
-  claudecron logs daily-digest -f
 
-Data dir resolution order:
-  \$CLAUDECRON_HOME -> \$XDG_CONFIG_HOME/claudecron -> ~/.config/claudecron
-EOF
-}
+def host_slug():
+    try:
+        name = socket.gethostname().split(".")[0]
+    except OSError:
+        name = ""
+    if not name:
+        name = "localhost"
+    name = re.sub(r"[^A-Za-z0-9._-]", "-", name)
+    return name or "localhost"
 
-# Parse leading global flags. Stops at the first non-flag token (subcommand).
-_parse_globals() {
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      --json)         CC_JSON=1; shift ;;
-      --config)
-        if [ "$#" -lt 2 ]; then
-          cc_die "--config requires a directory argument"
-        fi
-        CC_CONFIG_OVERRIDE="$2"; shift 2 ;;
-      --config=*)     CC_CONFIG_OVERRIDE="${1#*=}"; shift ;;
-      -q|--quiet)     CC_VERBOSITY=0; shift ;;
-      -v|--verbose)   CC_VERBOSITY=2; shift ;;
-      --)             shift; break ;;
-      -h|--help)      _cc_global_args="help"; return 0 ;;
-      -*)
-        # Unknown global flag before the subcommand.
-        printf 'claudecron: unknown option: %s\n\n' "$1" >&2
-        usage >&2
-        exit 2 ;;
-      *)              break ;;
-    esac
-  done
-  # Remaining positional args (subcommand + its args) are returned via the
-  # global _CC_REST array so bash 3.2 can pass them on without word-splitting.
-  _CC_REST=( ${@+"$@"} )
-}
 
-_CC_REST=()
-_parse_globals ${@+"$@"}
+def parse_interval(raw):
+    """Accept 15, 15m, 90min, 2h; return integer minutes. Reject sub-minute."""
+    if raw is None:
+        raise ValueError("empty interval")
+    s = str(raw).strip()
+    m = re.match(r"^([0-9]+)\s*([a-zA-Z]*)$", s)
+    if not m:
+        raise ValueError("invalid interval '%s' (expected forms: 90, 15m, 2h)" % raw)
+    num = int(m.group(1))
+    unit = m.group(2).lower()
+    if unit in ("", "m", "min", "mins", "minute", "minutes"):
+        minutes = num
+    elif unit in ("h", "hr", "hrs", "hour", "hours"):
+        minutes = num * 60
+    elif unit in ("s", "sec", "secs", "second", "seconds"):
+        raise ValueError("sub-minute intervals are not supported (got '%s')" % raw)
+    else:
+        raise ValueError("unknown interval unit in '%s' (use m or h)" % raw)
+    if minutes < 1:
+        raise ValueError("interval must be at least 1 minute (got '%s')" % raw)
+    return minutes
 
-if [ "$_cc_global_args" = "help" ]; then
-  usage
-  exit 0
-fi
 
-# Apply --config override, then recompute all derived paths via cc_rehome
-# (defined in lib/common.sh). CLAUDECRON_HOME is honored first by cc__resolve_home.
-if [ -n "$CC_CONFIG_OVERRIDE" ]; then
-  CLAUDECRON_HOME="$CC_CONFIG_OVERRIDE"
-  export CLAUDECRON_HOME
-  cc_rehome
-fi
+def validate_id(loop_id):
+    """CLI-level id validation: letters, digits, dot, dash, underscore."""
+    if not loop_id or re.search(r"[^a-zA-Z0-9._-]", loop_id):
+        die("invalid loop id '%s' (allowed: letters, digits, dot, dash, underscore)" % loop_id)
+
+
+def iso_or_epoch_to_epoch(value):
+    """Return an int epoch from an int/str epoch or ISO-8601 string, else None."""
+    if value is None or value == "" or value == "null":
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    s = str(value).strip()
+    if s.isdigit():
+        return int(s)
+    for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return int(datetime.datetime.strptime(s, fmt).timestamp())
+        except ValueError:
+            continue
+    return None
+
 
 # ---------------------------------------------------------------------------
-# Subcommand dispatch.
+# Paths
 # ---------------------------------------------------------------------------
-if [ "${#_CC_REST[@]}" -eq 0 ]; then
-  usage >&2
-  exit 2
-fi
 
-_cmd="${_CC_REST[0]}"
-# Shift the subcommand off; the rest are its arguments.
-set -- ${_CC_REST[@]+"${_CC_REST[@]}"}
-shift
+class Paths:
+    def __init__(self, home_override=None):
+        self.home = self._resolve_home(home_override)
+        self.prompts = self.home / "prompts"
+        self.state = self.home / "state"
+        self.logs = self.home / "logs"
+        self.lock_dir = self.home / "lock"
+        self.registry = self.home / "registry.json"
+        self.config = self.home / "config.json"
+        self.runner_log = self.logs / "runner.log"
+        self.host = host_slug()
+
+    @staticmethod
+    def _resolve_home(override):
+        if override:
+            return Path(override)
+        env = os.environ.get("CLAUDECRON_HOME")
+        if env:
+            return Path(env)
+        xdg = os.environ.get("XDG_CONFIG_HOME")
+        if xdg:
+            return Path(xdg) / "claudecron"
+        home = os.environ.get("HOME")
+        if home:
+            return Path(home) / ".config" / "claudecron"
+        return Path(".") / ".claudecron"
+
+    def state_dir(self):
+        return self.state / self.host
+
+    def state_path(self, loop_id):
+        return self.state_dir() / ("%s.json" % loop_id)
+
+    def loop_log(self, loop_id):
+        return self.logs / ("%s.log" % loop_id)
+
+    def mkdirs(self):
+        for d in (self.home, self.prompts, self.state, self.state_dir(), self.logs):
+            d.mkdir(parents=True, exist_ok=True)
+
+    def runner_log_write(self, body):
+        self.logs.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(self.runner_log, "a") as fh:
+                fh.write("%s %s\n" % (now_iso(), body))
+        except OSError:
+            pass
 
-# ===========================================================================
-# init
-# ===========================================================================
-cmd_init() {
-  local no_scheduler=0
-  local no_skills=0
-  local backend=""
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      --no-scheduler) no_scheduler=1; shift ;;
-      --no-skills)    no_skills=1; shift ;;
-      --backend)
-        [ "$#" -ge 2 ] || cc_die "--backend requires a value (claude|codex)"
-        backend="$2"; shift 2 ;;
-      --backend=*)    backend="${1#*=}"; shift ;;
-      -h|--help)
-        cat <<EOF
-Usage: claudecron init [--backend claude|codex] [--no-scheduler] [--no-skills]
-
-Creates <CLAUDECRON_HOME> with default config.json and registry.json,
-seeds the prompts/ state/ logs/ lock/ subdirectories, installs the platform
-scheduler unless --no-scheduler is given, and installs the agent skills for
-Claude Code and Codex (so you can create loops by talking to your agent)
-unless --no-skills is given. Idempotent: an existing config or registry is
-never clobbered.
-EOF
-        return 0 ;;
-      *) cc_die "init: unexpected argument: $1" ;;
-    esac
-  done
-
-  if [ -n "$backend" ]; then
-    case "$backend" in
-      claude|codex) : ;;
-      *) cc_die "init: --backend must be 'claude' or 'codex' (got '$backend')" ;;
-    esac
-  fi
-
-  cc_mkdirs
-  cc_log info "data home: $CLAUDECRON_HOME"
-
-  # Write defaults without clobbering existing files.
-  cfg_init_defaults
-  if [ -n "$backend" ]; then
-    cfg_set backend "$backend"
-    cc_log info "backend set to $backend"
-  fi
-
-  loop_registry_init
-
-  if [ "$no_scheduler" -eq 1 ]; then
-    cc_log info "skipping scheduler install (--no-scheduler)"
-  elif [ "${CLAUDECRON_INIT_SCHEDULER:-1}" = "0" ]; then
-    cc_log info "skipping scheduler install (CLAUDECRON_INIT_SCHEDULER=0)"
-  else
-    local sched
-    sched="$(detect_scheduler)"
-    cc_log info "detected scheduler: $sched"
-    if [ "$sched" = "none" ]; then
-      cc_log warn "no supported scheduler found; run loops manually with 'claudecron run'"
-    else
-      scheduler_install
-    fi
-  fi
-
-  # Install the agent skills so users can create loops conversationally.
-  if [ "$no_skills" -eq 1 ]; then
-    cc_log info "skipping skills install (--no-skills)"
-  else
-    skills_install || cc_log warn "skills install reported a problem (continuing)"
-  fi
-
-  cc_log info "init complete. add a loop with: claudecron add <id>"
-}
-
-# ===========================================================================
-# add
-# ===========================================================================
-cmd_add() {
-  local id=""
-  local interval=""
-  local cwd=""
-  local tools=""
-  local backend=""
-  local prompt_inline=""
-  local prompt_file_src=""
-  local prompt_from_stdin=0
-  local enabled="true"
-  local force=0
-  local interactive=1
-  # add_dirs collected as a repeatable flag.
-  local add_dirs=()
-
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      --interval)
-        [ "$#" -ge 2 ] || cc_die "--interval requires minutes"
-        interval="$2"; interactive=0; shift 2 ;;
-      --interval=*) interval="${1#*=}"; interactive=0; shift ;;
-      --cwd)
-        [ "$#" -ge 2 ] || cc_die "--cwd requires a path"
-        cwd="$2"; interactive=0; shift 2 ;;
-      --cwd=*) cwd="${1#*=}"; interactive=0; shift ;;
-      --add-dir)
-        [ "$#" -ge 2 ] || cc_die "--add-dir requires a path"
-        add_dirs[${#add_dirs[@]}]="$2"; interactive=0; shift 2 ;;
-      --add-dir=*) add_dirs[${#add_dirs[@]}]="${1#*=}"; interactive=0; shift ;;
-      --tools)
-        [ "$#" -ge 2 ] || cc_die "--tools requires a comma list"
-        tools="$2"; interactive=0; shift 2 ;;
-      --tools=*) tools="${1#*=}"; interactive=0; shift ;;
-      --backend)
-        [ "$#" -ge 2 ] || cc_die "--backend requires a value"
-        backend="$2"; interactive=0; shift 2 ;;
-      --backend=*) backend="${1#*=}"; interactive=0; shift ;;
-      --prompt)
-        [ "$#" -ge 2 ] || cc_die "--prompt requires text"
-        prompt_inline="$2"; interactive=0; shift 2 ;;
-      --prompt=*) prompt_inline="${1#*=}"; interactive=0; shift ;;
-      --prompt-file)
-        [ "$#" -ge 2 ] || cc_die "--prompt-file requires a path"
-        prompt_file_src="$2"; interactive=0; shift 2 ;;
-      --prompt-file=*) prompt_file_src="${1#*=}"; interactive=0; shift ;;
-      -)  prompt_from_stdin=1; interactive=0; shift ;;
-      --enabled)  enabled="true";  interactive=0; shift ;;
-      --disabled) enabled="false"; interactive=0; shift ;;
-      --force)    force=1; shift ;;
-      -h|--help)
-        cat <<EOF
-Usage: claudecron add <id> [options]
-
-Scripted:
-  --interval <minutes>     How often the loop is due (default 15).
-  --cwd <abs-dir>          Working directory for the agent.
-  --add-dir <abs-dir>      Extra dir the agent may access (repeatable).
-  --tools <T1,T2,...>      Allowed tools, comma-separated.
-  --backend claude|codex   Backend for this loop (default: config backend).
-  --prompt <text>          Inline prompt text.
-  --prompt-file <path>     Read prompt from a file.
-  -                        Read prompt from stdin.
-  --enabled | --disabled   Initial enabled state (default enabled).
-  --force                  Overwrite an existing loop with the same id.
-
-Run with just <id> for an interactive prompt. add NEVER runs the loop.
-
-Example:
-  claudecron add pr-babysitter --interval 15 \\
-      --cwd "\$HOME/src/hello-world" --tools "Bash,Read" --prompt-file ./pr.md
-EOF
-        return 0 ;;
-      -*) cc_die "add: unknown option: $1" ;;
-      *)
-        if [ -z "$id" ]; then
-          id="$1"; shift
-        else
-          cc_die "add: unexpected argument: $1"
-        fi ;;
-    esac
-  done
-
-  [ -n "$id" ] || cc_die "add: missing loop <id> (e.g. pr-babysitter)"
-  _cc_validate_id "$id"
-
-  # Refuse to overwrite unless --force.
-  if loop_get "$id" >/dev/null 2>&1 && [ "$force" -ne 1 ]; then
-    cc_die "loop '$id' already exists; pass --force to overwrite"
-  fi
-
-  # Interactive path: bare invocation with no scripting flags.
-  if [ "$interactive" -eq 1 ]; then
-    _cc_add_interactive_collect
-    # _cc_add_interactive_collect populates: interval cwd tools backend
-    #   add_dirs[] enabled prompt_inline
-  fi
-
-  # Defaults for anything still unset.
-  [ -n "$interval" ] || interval=15
-  # Accept friendly forms (15, 15m, 2h) via the shared parser, which normalizes
-  # to integer minutes and rejects sub-minute values.
-  interval="$(parse_interval "$interval")" \
-    || cc_die "add: --interval must be a positive duration like 15, 15m, or 2h"
-  [ "$interval" -ge 1 ] || cc_die "add: --interval must be >= 1 minute"
-
-  if [ -z "$cwd" ]; then
-    cwd="$PWD"
-    cc_log warn "no --cwd given; defaulting to $cwd"
-  fi
-  case "$cwd" in
-    /*) : ;;
-    *)  cc_die "add: --cwd must be an absolute path (got '$cwd')" ;;
-  esac
-  [ -d "$cwd" ] || cc_log warn "cwd does not exist yet: $cwd"
-
-  # Validate add_dirs are absolute.
-  local d
-  for d in ${add_dirs[@]+"${add_dirs[@]}"}; do
-    case "$d" in
-      /*) : ;;
-      *)  cc_die "add: --add-dir must be absolute (got '$d')" ;;
-    esac
-  done
-
-  [ -n "$tools" ] || tools="Bash,Read,Write,Edit"
-
-  if [ -z "$backend" ]; then
-    backend="$(cfg_get backend)"
-    [ -n "$backend" ] || backend="claude"
-  fi
-  case "$backend" in
-    claude|codex) : ;;
-    *) cc_die "add: backend must be 'claude' or 'codex' (got '$backend')" ;;
-  esac
-
-  # Resolve the prompt content from exactly one source.
-  local prompt_content=""
-  local sources=0
-  [ -n "$prompt_inline" ]    && sources=$((sources + 1))
-  [ -n "$prompt_file_src" ]  && sources=$((sources + 1))
-  [ "$prompt_from_stdin" -eq 1 ] && sources=$((sources + 1))
-  if [ "$sources" -gt 1 ]; then
-    cc_die "add: choose only one of --prompt, --prompt-file, or - (stdin)"
-  fi
-
-  if [ -n "$prompt_inline" ]; then
-    prompt_content="$prompt_inline"
-  elif [ -n "$prompt_file_src" ]; then
-    [ -f "$prompt_file_src" ] || cc_die "add: prompt file not found: $prompt_file_src"
-    prompt_content="$(cat "$prompt_file_src")"
-  elif [ "$prompt_from_stdin" -eq 1 ]; then
-    prompt_content="$(cat)"
-  fi
-
-  if [ -z "$prompt_content" ]; then
-    cc_die "add: empty prompt; provide --prompt, --prompt-file, or - (stdin)"
-  fi
-
-  # Write the prompt file under prompts/<id>.md.
-  local prompt_rel="prompts/${id}.md"
-  local prompt_abs="$CLAUDECRON_HOME/$prompt_rel"
-  mkdir -p "$CLAUDECRON_HOME/prompts"
-  printf '%s\n' "$prompt_content" > "$prompt_abs"
-  cc_log info "wrote prompt: $prompt_abs"
-
-  # Build the add-dir JSON array via cc_jq from the collected list.
-  local add_dirs_json
-  add_dirs_json="$(_cc_dirs_to_json ${add_dirs[@]+"${add_dirs[@]}"})"
-
-  # Upsert the registry entry. loop_upsert takes the full JSON object on stdin.
-  cc_jq -n \
-    --arg id "$id" \
-    --argjson enabled "$enabled" \
-    --argjson interval "$interval" \
-    --arg cwd "$cwd" \
-    --argjson add_dirs "$add_dirs_json" \
-    --arg tools "$tools" \
-    --arg prompt_file "$prompt_rel" \
-    --arg backend "$backend" \
-    '{
-       id: $id,
-       enabled: $enabled,
-       interval_minutes: $interval,
-       cwd: $cwd,
-       add_dirs: $add_dirs,
-       allowed_tools: $tools,
-       prompt_file: $prompt_file,
-       backend: $backend
-     }' | loop_upsert "$id"
-
-  cc_log info "added loop '$id' (interval ${interval}m, backend $backend, enabled=$enabled)"
-  cc_log info "it will NOT run until the scheduler fires; test now with: claudecron run --now $id"
-}
-
-# Interactive collection helper for `add`. Reads from /dev/tty so it works
-# even when stdin is otherwise redirected. Sets caller locals by name via
-# the shared parent scope (these are declared in cmd_add).
-_cc_add_interactive_collect() {
-  local _ans
-  printf 'Configuring loop "%s" (press Enter to accept the default).\n' "$id" >&2
-
-  _cc_ask "Interval in minutes" "15"; interval="$_cc_reply"
-  _cc_ask "Working directory (absolute)" "$PWD"; cwd="$_cc_reply"
-  _cc_ask "Allowed tools (comma-separated)" "Bash,Read,Write,Edit"; tools="$_cc_reply"
-
-  local _def_backend
-  _def_backend="$(cfg_get backend)"; [ -n "$_def_backend" ] || _def_backend="claude"
-  _cc_ask "Backend (claude|codex)" "$_def_backend"; backend="$_cc_reply"
-
-  # Optional extra dirs, one per line, blank to finish.
-  printf 'Extra accessible dirs (--add-dir), one per line, blank to finish:\n' >&2
-  while :; do
-    printf '  add-dir> ' >&2
-    if ! IFS= read -r _ans < /dev/tty; then break; fi
-    [ -z "$_ans" ] && break
-    add_dirs[${#add_dirs[@]}]="$_ans"
-  done
-
-  _cc_ask "Enabled now? (y/n)" "y"
-  case "$_cc_reply" in
-    n|N|no|NO) enabled="false" ;;
-    *)         enabled="true" ;;
-  esac
-
-  printf 'Enter the prompt. Finish with a single line containing only EOF:\n' >&2
-  local _line _buf=""
-  while IFS= read -r _line < /dev/tty; do
-    [ "$_line" = "EOF" ] && break
-    _buf="${_buf}${_line}
-"
-  done
-  prompt_inline="$_buf"
-}
-
-# Ask a single question with a default. Result in $_cc_reply.
-_cc_ask() {
-  local _q="$1" _def="$2" _r=""
-  printf '%s [%s]: ' "$_q" "$_def" >&2
-  if IFS= read -r _r < /dev/tty; then :; fi
-  [ -n "$_r" ] || _r="$_def"
-  _cc_reply="$_r"
-}
-_cc_reply=""
-
-# Convert a list of dir args into a JSON array string.
-_cc_dirs_to_json() {
-  if [ "$#" -eq 0 ]; then
-    printf '[]'
-    return 0
-  fi
-  local _out
-  _out="$(
-    for d in "$@"; do printf '%s\n' "$d"; done \
-      | cc_jq -R . | cc_jq -s .
-  )"
-  printf '%s' "$_out"
-}
-
-# Validate a loop id is a safe slug (filesystem + json friendly).
-_cc_validate_id() {
-  case "$1" in
-    ''|*[!a-zA-Z0-9._-]*)
-      cc_die "invalid loop id '$1' (allowed: letters, digits, dot, dash, underscore)" ;;
-  esac
-}
-
-# ===========================================================================
-# list
-# ===========================================================================
-cmd_list() {
-  local as_json="$CC_JSON"
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      --json) as_json=1; shift ;;
-      -h|--help) printf 'Usage: claudecron list [--json]\n'; return 0 ;;
-      *) cc_die "list: unexpected argument: $1" ;;
-    esac
-  done
-
-  if [ "$as_json" -eq 1 ]; then
-    cc_jq '[.loops[].id]' "$(loop_registry_path)"
-    return 0
-  fi
-
-  local ids
-  ids="$(cc_jq -r '.loops[].id' "$(loop_registry_path)" 2>/dev/null || true)"
-  if [ -z "$ids" ]; then
-    cc_log info "no loops yet; add one with: claudecron add <id>"
-    return 0
-  fi
-  printf '%s\n' "$ids"
-}
-
-# ===========================================================================
-# status
-# ===========================================================================
-cmd_status() {
-  local as_json="$CC_JSON"
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      --json) as_json=1; shift ;;
-      -h|--help) printf 'Usage: claudecron status [--json]\n'; return 0 ;;
-      *) cc_die "status: unexpected argument: $1" ;;
-    esac
-  done
-
-  local ids
-  ids="$(cc_jq -r '.loops[].id' "$(loop_registry_path)" 2>/dev/null || true)"
-
-  if [ "$as_json" -eq 1 ]; then
-    _cc_status_json
-    return 0
-  fi
-
-  if [ -z "$ids" ]; then
-    cc_log info "no loops registered"
-    return 0
-  fi
-
-  # Header.
-  printf '%-20s %-8s %-9s %-8s %-20s %-9s %s\n' \
-    ID ENABLED INTERVAL BACKEND LAST_RUN STATUS NEXT_DUE
-  printf '%-20s %-8s %-9s %-8s %-20s %-9s %s\n' \
-    -------------------- -------- --------- -------- -------------------- --------- --------
-
-  local id entry enabled interval backend last_run last_status next_due
-  printf '%s\n' "$ids" | while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    entry="$(loop_get "$id")"
-    enabled="$(printf '%s' "$entry"  | cc_jq -r '.enabled')"
-    interval="$(printf '%s' "$entry" | cc_jq -r '.interval_minutes')"
-    backend="$(printf '%s' "$entry"  | cc_jq -r '.backend')"
-
-    last_run="$(state_get "$id" last_run)"
-    [ -n "$last_run" ] || last_run="-"
-    last_status="$(state_get "$id" last_status)"
-    [ -n "$last_status" ] || last_status="-"
-
-    if is_due "$id" >/dev/null 2>&1; then
-      next_due="now"
-    else
-      next_due="$(_cc_next_due_human "$id" "$interval")"
-    fi
-
-    printf '%-20s %-8s %-9s %-8s %-20s %-9s %s\n' \
-      "$id" "$enabled" "${interval}m" "$backend" "$last_run" "$last_status" "$next_due"
-  done
-}
-
-_cc_status_json() {
-  local ids id entry last_run last_status
-  ids="$(cc_jq -r '.loops[].id' "$(loop_registry_path)" 2>/dev/null || true)"
-  printf '['
-  local first=1
-  printf '%s\n' "$ids" | while IFS= read -r id; do
-    [ -n "$id" ] || continue
-    entry="$(loop_get "$id")"
-    last_run="$(state_get "$id" last_run)"
-    last_status="$(state_get "$id" last_status)"
-    if [ "$first" -eq 1 ]; then first=0; else printf ','; fi
-    printf '%s' "$entry" | cc_jq -c \
-      --arg last_run "$last_run" \
-      --arg last_status "$last_status" \
-      '{id, enabled, interval_minutes, backend,
-        last_run: ($last_run // ""),
-        last_status: ($last_status // "")}'
-  done
-  printf ']\n'
-}
-
-# Best-effort human next-due. Uses state last_run + interval. Falls back to
-# the interval string if dates cannot be computed on this platform.
-_cc_next_due_human() {
-  local id="$1" interval="$2" last_epoch
-  last_epoch="$(state_get "$id" last_run_epoch)"
-  if [ -z "$last_epoch" ]; then
-    printf 'now'
-    return 0
-  fi
-  local now_epoch due_epoch remain_min
-  now_epoch="$(date +%s)"
-  due_epoch=$(( last_epoch + interval * 60 ))
-  if [ "$now_epoch" -ge "$due_epoch" ]; then
-    printf 'now'
-    return 0
-  fi
-  remain_min=$(( (due_epoch - now_epoch + 59) / 60 ))
-  printf 'in %dm' "$remain_min"
-}
-
-# ===========================================================================
-# run
-# ===========================================================================
-cmd_run() {
-  local force_id=""
-  local dry_run=0
-  local backend_override=""
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      --now)
-        [ "$#" -ge 2 ] || cc_die "--now requires a loop id"
-        force_id="$2"; shift 2 ;;
-      --now=*) force_id="${1#*=}"; shift ;;
-      --dry-run) dry_run=1; shift ;;
-      --backend)
-        [ "$#" -ge 2 ] || cc_die "--backend requires a value"
-        backend_override="$2"; shift 2 ;;
-      --backend=*) backend_override="${1#*=}"; shift ;;
-      --wake) shift ;;   # alias the scheduler uses; identical to a bare pass
-      -h|--help)
-        cat <<EOF
-Usage: claudecron run [--now <id>] [--dry-run] [--backend claude|codex] [--wake]
-
-  (bare)        Run one full due pass over all enabled loops.
-  --now <id>    Force one run of <id> regardless of due time / enabled state.
-  --dry-run     Show what would run without invoking any backend.
-  --backend B   Override the backend for this invocation.
-  --wake        Alias for a bare pass (used by the scheduler).
-EOF
-        return 0 ;;
-      -*) cc_die "run: unknown option: $1" ;;
-      *) cc_die "run: unexpected argument: $1" ;;
-    esac
-  done
-
-  if [ -n "$backend_override" ]; then
-    case "$backend_override" in
-      claude|codex) : ;;
-      *) cc_die "run: --backend must be 'claude' or 'codex'" ;;
-    esac
-    CLAUDECRON_BACKEND_OVERRIDE="$backend_override"
-    export CLAUDECRON_BACKEND_OVERRIDE
-  fi
-  if [ "$dry_run" -eq 1 ]; then
-    CLAUDECRON_DRY_RUN=1
-    export CLAUDECRON_DRY_RUN
-  fi
-
-  if [ -n "$force_id" ]; then
-    _cc_validate_id "$force_id"
-    loop_get "$force_id" >/dev/null 2>&1 || cc_die "run: no such loop '$force_id'"
-    cc_log info "forcing run of '$force_id' (ignoring due/enabled)"
-    cc_run --id "$force_id" --force
-    return $?
-  fi
-
-  # Bare / --wake: a single due pass over the whole registry.
-  cc_log info "starting due pass on $(cc_hostname_s)"
-  cc_run_pass
-}
-
-# ===========================================================================
-# logs
-# ===========================================================================
-cmd_logs() {
-  local id=""
-  local follow=0
-  local lines=""
-  local runner=0
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      -f|--follow) follow=1; shift ;;
-      -n)
-        [ "$#" -ge 2 ] || cc_die "-n requires a line count"
-        lines="$2"; shift 2 ;;
-      -n*) lines="${1#-n}"; shift ;;
-      --lines=*) lines="${1#*=}"; shift ;;
-      --runner) runner=1; shift ;;
-      -h|--help)
-        cat <<EOF
-Usage: claudecron logs <id> [-f] [-n N] [--runner]
-
-  <id>        Tail prompts/<id>.log (per-loop output).
-  -f          Follow (tail -f).
-  -n N        Show the last N lines (default 200).
-  --runner    Tail the shared runner log instead of a per-loop log.
-EOF
-        return 0 ;;
-      -*) cc_die "logs: unknown option: $1" ;;
-      *)
-        if [ -z "$id" ]; then id="$1"; shift; else cc_die "logs: unexpected argument: $1"; fi ;;
-    esac
-  done
-
-  [ -n "$lines" ] || lines=200
-  case "$lines" in ''|*[!0-9]*) cc_die "logs: -n must be a number" ;; esac
-
-  local target
-  if [ "$runner" -eq 1 ]; then
-    target="$CLAUDECRON_HOME/logs/runner.log"
-  else
-    [ -n "$id" ] || cc_die "logs: missing <id> (or pass --runner for the runner log)"
-    _cc_validate_id "$id"
-    target="$CLAUDECRON_HOME/logs/${id}.log"
-  fi
-
-  if [ ! -f "$target" ]; then
-    cc_log warn "no log yet at $target"
-    return 0
-  fi
-
-  if [ "$follow" -eq 1 ]; then
-    tail -n "$lines" -f "$target"
-  else
-    tail -n "$lines" "$target"
-  fi
-}
-
-# ===========================================================================
-# enable / disable
-# ===========================================================================
-cmd_enable()  { _cc_toggle enable  ${@+"$@"}; }
-cmd_disable() { _cc_toggle disable ${@+"$@"}; }
-
-_cc_toggle() {
-  local verb="$1"; shift
-  local want="true"
-  [ "$verb" = "disable" ] && want="false"
-
-  local id=""
-  local scheduler=0
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      --scheduler) scheduler=1; shift ;;
-      -h|--help)
-        printf 'Usage: claudecron %s <id>\n       claudecron %s --scheduler\n' "$verb" "$verb"
-        return 0 ;;
-      -*) cc_die "$verb: unknown option: $1" ;;
-      *)
-        if [ -z "$id" ]; then id="$1"; shift; else cc_die "$verb: unexpected argument: $1"; fi ;;
-    esac
-  done
-
-  if [ "$scheduler" -eq 1 ]; then
-    if [ "$verb" = "enable" ]; then
-      scheduler_enable
-      cc_log info "scheduler enabled"
-    else
-      scheduler_disable
-      cc_log info "scheduler disabled (loops will not fire until re-enabled)"
-    fi
-    return 0
-  fi
-
-  [ -n "$id" ] || cc_die "$verb: missing <id> (or pass --scheduler)"
-  _cc_validate_id "$id"
-  loop_get "$id" >/dev/null 2>&1 || cc_die "$verb: no such loop '$id'"
-
-  loop_get "$id" | cc_jq -c --argjson e "$want" '.enabled = $e' | loop_upsert "$id"
-  cc_log info "loop '$id' ${verb}d"
-}
-
-# ===========================================================================
-# remove
-# ===========================================================================
-cmd_remove() {
-  local id=""
-  local purge=0
-  local yes=0
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      --purge) purge=1; shift ;;
-      --yes|-y) yes=1; shift ;;
-      -h|--help)
-        cat <<EOF
-Usage: claudecron remove <id> [--purge] [--yes]
-
-  Removes the registry entry for <id>.
-  --purge   Also delete prompts/<id>.md and state/*/<id>.json.
-  --yes     Skip the confirmation prompt.
-EOF
-        return 0 ;;
-      -*) cc_die "remove: unknown option: $1" ;;
-      *)
-        if [ -z "$id" ]; then id="$1"; shift; else cc_die "remove: unexpected argument: $1"; fi ;;
-    esac
-  done
-
-  [ -n "$id" ] || cc_die "remove: missing <id>"
-  _cc_validate_id "$id"
-  loop_get "$id" >/dev/null 2>&1 || cc_die "remove: no such loop '$id'"
-
-  if [ "$yes" -ne 1 ]; then
-    local _ans=""
-    printf 'Remove loop "%s"%s? [y/N]: ' "$id" "$( [ "$purge" -eq 1 ] && printf ' and PURGE its prompt+state' )" >&2
-    if IFS= read -r _ans < /dev/tty 2>/dev/null; then :; fi
-    case "$_ans" in
-      y|Y|yes|YES) : ;;
-      *) cc_log info "aborted"; return 0 ;;
-    esac
-  fi
-
-  loop_remove "$id"
-  cc_log info "removed registry entry '$id'"
-
-  if [ "$purge" -eq 1 ]; then
-    local pf="$CLAUDECRON_HOME/prompts/${id}.md"
-    if [ -f "$pf" ]; then rm -f "$pf"; cc_log info "purged $pf"; fi
-    # Remove per-host state files for this id across all hosts.
-    local sd
-    if [ -d "$CLAUDECRON_HOME/state" ]; then
-      for sd in "$CLAUDECRON_HOME"/state/*/; do
-        [ -d "$sd" ] || continue
-        if [ -f "${sd}${id}.json" ]; then
-          rm -f "${sd}${id}.json"
-          cc_log info "purged ${sd}${id}.json"
-        fi
-      done
-    fi
-  fi
-}
-
-# ===========================================================================
-# doctor
-# ===========================================================================
-cmd_doctor() {
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      -h|--help) printf 'Usage: claudecron doctor\n\nRuns preflight checks. Exits non-zero if any check FAILs.\n'; return 0 ;;
-      *) cc_die "doctor: unexpected argument: $1" ;;
-    esac
-  done
-
-  local fails=0
-  _doc_ok()   { printf '  [ OK ] %s\n' "$1"; }
-  _doc_warn() { printf '  [WARN] %s\n' "$1"; }
-  _doc_fail() { printf '  [FAIL] %s\n' "$1"; fails=$((fails + 1)); }
-
-  printf 'claudecron doctor (%s)\n' "$CLAUDECRON_VERSION"
-  printf 'home: %s\n' "$CLAUDECRON_HOME"
-  printf 'libexec: %s\n\n' "$CLAUDECRON_LIBEXEC"
-
-  # 1. bash version (need 3.2+; we target macOS 3.2).
-  printf 'environment:\n'
-  local bash_major="${BASH_VERSINFO[0]:-0}"
-  local bash_minor="${BASH_VERSINFO[1]:-0}"
-  if [ "$bash_major" -gt 3 ] || { [ "$bash_major" -eq 3 ] && [ "$bash_minor" -ge 2 ]; }; then
-    _doc_ok "bash ${BASH_VERSION}"
-  else
-    _doc_fail "bash ${BASH_VERSION} is too old; need 3.2+"
-  fi
-
-  # 2. jq present.
-  if command -v jq >/dev/null 2>&1; then
-    _doc_ok "jq $(jq --version 2>/dev/null || true)"
-  else
-    _doc_fail "jq not found in PATH; install jq (brew install jq / apt-get install jq)"
-  fi
-
-  # 3. date flavor.
-  if date -j >/dev/null 2>&1; then
-    _doc_ok "date: BSD (date -j) detected"
-  elif date -d @0 >/dev/null 2>&1; then
-    _doc_ok "date: GNU (date -d) detected"
-  else
-    _doc_warn "date: could not classify; due-time math may be limited"
-  fi
-
-  # 4. backend binaries.
-  printf '\nbackends:\n'
-  printf '  PATH=%s\n' "$PATH"
-  local cfg_backend cbin xbin
-  cfg_backend="$(cfg_get backend 2>/dev/null || true)"
-  [ -n "$cfg_backend" ] || cfg_backend="claude"
-  printf '  configured backend: %s\n' "$cfg_backend"
-
-  cbin="$(resolve_backend_bin claude 2>/dev/null || true)"
-  if [ -n "$cbin" ] && [ -x "$cbin" ]; then
-    _doc_ok "claude -> $cbin ($("$cbin" --version 2>/dev/null | head -n1 || echo '?'))"
-  else
-    if [ "$cfg_backend" = "claude" ]; then
-      _doc_fail "claude backend not resolved; set claude_bin in config.json or add it to PATH"
-    else
-      _doc_warn "claude backend not resolved (not the active backend)"
-    fi
-  fi
-
-  xbin="$(resolve_backend_bin codex 2>/dev/null || true)"
-  if [ -n "$xbin" ] && [ -x "$xbin" ]; then
-    _doc_ok "codex -> $xbin ($("$xbin" --version 2>/dev/null | head -n1 || echo '?'))"
-  else
-    if [ "$cfg_backend" = "codex" ]; then
-      _doc_fail "codex backend not resolved; set codex_bin in config.json or add it to PATH"
-    else
-      _doc_warn "codex backend not resolved (not the active backend)"
-    fi
-  fi
-
-  # 5. registry validity.
-  printf '\nregistry:\n'
-  local reg
-  reg="$(loop_registry_path)"
-  if [ ! -f "$reg" ]; then
-    _doc_warn "no registry yet at $reg; run 'claudecron init'"
-  elif cc_jq -e '.loops | type == "array"' "$reg" >/dev/null 2>&1; then
-    local n
-    n="$(cc_jq -r '.loops | length' "$reg")"
-    _doc_ok "registry valid ($n loop(s))"
-  else
-    _doc_fail "registry is malformed: $reg (expected { \"loops\": [...] })"
-  fi
-
-  # 6. config validity.
-  local cfg
-  cfg="$(cfg_path)"
-  if [ ! -f "$cfg" ]; then
-    _doc_warn "no config yet at $cfg; run 'claudecron init'"
-  elif cc_jq -e '.' "$cfg" >/dev/null 2>&1; then
-    _doc_ok "config valid"
-  else
-    _doc_fail "config is not valid JSON: $cfg"
-  fi
-
-  # 7. scheduler.
-  printf '\nscheduler:\n'
-  local sched
-  sched="$(detect_scheduler 2>/dev/null || echo none)"
-  printf '  type: %s\n' "$sched"
-  if scheduler_is_loaded >/dev/null 2>&1; then
-    _doc_ok "scheduler unit loaded (dev.claudecron.runner)"
-    local lw
-    lw="$(scheduler_last_wake 2>/dev/null || true)"
-    [ -n "$lw" ] && printf '  last wake: %s\n' "$lw"
-  else
-    _doc_warn "scheduler not loaded; install with 'claudecron scheduler install'"
-  fi
-
-  # 8. stale lock.
-  printf '\nlock:\n'
-  if [ -d "$CLAUDECRON_HOME/lock" ] && [ "$(ls -A "$CLAUDECRON_HOME/lock" 2>/dev/null || true)" != "" ]; then
-    if lock_is_stale >/dev/null 2>&1; then
-      _doc_warn "a STALE lock is present; clear it with: rm -rf '$CLAUDECRON_HOME/lock'/*"
-    else
-      _doc_ok "a lock is held (a run may be in progress)"
-    fi
-  else
-    _doc_ok "no lock held"
-  fi
-
-  printf '\n'
-  if [ "$fails" -gt 0 ]; then
-    printf 'doctor: %d check(s) FAILED.\n' "$fails"
-    return 1
-  fi
-  printf 'doctor: all critical checks passed.\n'
-  return 0
-}
-
-# ===========================================================================
-# scheduler
-# ===========================================================================
-cmd_scheduler() {
-  local action=""
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      -h|--help)
-        printf 'Usage: claudecron scheduler {install|remove|status}\n'; return 0 ;;
-      -*) cc_die "scheduler: unknown option: $1" ;;
-      *) if [ -z "$action" ]; then action="$1"; shift; else cc_die "scheduler: unexpected argument: $1"; fi ;;
-    esac
-  done
-
-  [ -n "$action" ] || cc_die "scheduler: need an action (install|remove|status)"
-  case "$action" in
-    install) scheduler_install ;;
-    remove)  scheduler_remove ;;
-    status)  scheduler_status ;;
-    *) cc_die "scheduler: unknown action '$action' (install|remove|status)" ;;
-  esac
-}
-
-# ===========================================================================
-# skills - install/remove the agent skills for Claude Code and Codex
-# ===========================================================================
-cmd_skills() {
-  local action="${1:-}"
-  case "$action" in
-    install) skills_install ;;
-    remove)  skills_remove ;;
-    status|"") skills_status ;;
-    -h|--help)
-      cat <<EOF
-Usage: claudecron skills <install|remove|status>
-
-  install   Install the claudecron skills into Claude Code (~/.claude/skills)
-            and Codex (~/.codex/prompts), wherever they are detected. This lets
-            you create and manage loops by talking to your agent.
-  remove    Remove the installed skills from both agents.
-  status    Show where the skills are installed (default).
-EOF
-      ;;
-    *) cc_die "skills: unknown action '$action' (install|remove|status)" ;;
-  esac
-}
-
-# ===========================================================================
-# uninstall
-# ===========================================================================
-cmd_uninstall() {
-  local purge=0
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      --purge) purge=1; shift ;;
-      -h|--help)
-        cat <<EOF
-Usage: claudecron uninstall [--purge]
-
-  Removes the scheduler unit (dev.claudecron.runner) and the agent skills
-  installed into Claude Code and Codex.
-  --purge   Also delete the entire data home: $CLAUDECRON_HOME
-EOF
-        return 0 ;;
-      *) cc_die "uninstall: unexpected argument: $1" ;;
-    esac
-  done
-  cc_uninstall "$purge"
-  skills_remove
-}
-
-# ===========================================================================
-# version
-# ===========================================================================
-cmd_version() {
-  if [ "$CC_JSON" -eq 1 ]; then
-    cc_jq -n --arg v "$CLAUDECRON_VERSION" --arg libexec "$CLAUDECRON_LIBEXEC" \
-      '{name:"claudecron", version:$v, libexec:$libexec}'
-  else
-    printf 'claudecron %s\n' "$CLAUDECRON_VERSION"
-  fi
-}
 
 # ---------------------------------------------------------------------------
-# Dispatch table.
+# Config
 # ---------------------------------------------------------------------------
-case "$_cmd" in
-  init)       cmd_init       ${@+"$@"} ;;
-  add)        cmd_add        ${@+"$@"} ;;
-  list|ls)    cmd_list       ${@+"$@"} ;;
-  status|st)  cmd_status     ${@+"$@"} ;;
-  run)        cmd_run        ${@+"$@"} ;;
-  logs|log)   cmd_logs       ${@+"$@"} ;;
-  enable)     cmd_enable     ${@+"$@"} ;;
-  disable)    cmd_disable    ${@+"$@"} ;;
-  remove|rm)  cmd_remove     ${@+"$@"} ;;
-  doctor)     cmd_doctor     ${@+"$@"} ;;
-  scheduler)  cmd_scheduler  ${@+"$@"} ;;
-  skills)     cmd_skills     ${@+"$@"} ;;
-  uninstall)  cmd_uninstall  ${@+"$@"} ;;
-  version|--version|-V) cmd_version ${@+"$@"} ;;
-  help|--help|-h) usage ;;
-  *)
-    printf 'claudecron: unknown command: %s\n\n' "$_cmd" >&2
-    usage >&2
-    exit 2 ;;
-esac
+
+class Config:
+    """config.json: 5 written defaults + optional read-only on_failure_cmd /
+    run_timeout_s. The file wins over defaults; unknown keys are preserved."""
+
+    DEFAULTS = {
+        "backend": DEFAULT_BACKEND,
+        "lock_stale_minutes": DEFAULT_LOCK_STALE_MINUTES,
+        "log_keep_lines": DEFAULT_LOG_KEEP_LINES,
+        "claude_bin": "",
+        "codex_bin": "",
+    }
+
+    def __init__(self, paths):
+        self.paths = paths
+
+    def default_json(self):
+        return dict(self.DEFAULTS)
+
+    def ensure(self):
+        self.paths.mkdirs()
+        if not self.paths.config.exists():
+            write_json(self.paths.config, self.default_json())
+            log_stderr("created default config at %s" % self.paths.config)
+
+    def read(self):
+        merged = self.default_json()
+        merged.update(load_json(self.paths.config, {}))
+        return merged
+
+    def get(self, key, default=None):
+        val = self.read().get(key)
+        if val is None or val == "":
+            return default
+        return val
+
+    def set(self, key, value):
+        self.ensure()
+        data = self.read()
+        data[key] = value
+        write_json(self.paths.config, data)
+
+
+# ---------------------------------------------------------------------------
+# Registry
+# ---------------------------------------------------------------------------
+
+class Registry:
+    def __init__(self, paths):
+        self.paths = paths
+
+    def ensure(self):
+        self.paths.mkdirs()
+        if not self.paths.registry.exists():
+            write_json(self.paths.registry, {"loops": []})
+            log_stderr("created empty registry at %s" % self.paths.registry)
+
+    def read(self):
+        data = load_json(self.paths.registry, {"loops": []})
+        loops = data.get("loops")
+        if not isinstance(loops, list):
+            loops = []
+        return {"loops": loops}
+
+    def loops(self):
+        return self.read()["loops"]
+
+    def get(self, loop_id):
+        for loop in self.loops():
+            if loop.get("id") == loop_id:
+                return loop
+        return None
+
+    def exists(self, loop_id):
+        return self.get(loop_id) is not None
+
+    def upsert(self, obj):
+        loop_id = obj["id"]
+        loops = [x for x in self.loops() if x.get("id") != loop_id]
+        loops.append(obj)
+        write_json(self.paths.registry, {"loops": loops})
+
+    def remove(self, loop_id):
+        loops = [x for x in self.loops() if x.get("id") != loop_id]
+        write_json(self.paths.registry, {"loops": loops})
+
+
+# ---------------------------------------------------------------------------
+# State: per-host run state, read-merge-write so loop-owned keys survive
+# ---------------------------------------------------------------------------
+
+class State:
+    def __init__(self, paths):
+        self.paths = paths
+
+    def get(self, loop_id):
+        return load_json(self.paths.state_path(loop_id), {})
+
+    def last_run_epoch(self, loop_id):
+        return iso_or_epoch_to_epoch(self.get(loop_id).get("last_run"))
+
+    def record_run(self, loop_id, status, duration_s):
+        try:
+            duration_s = int(duration_s)
+        except (TypeError, ValueError):
+            duration_s = 0
+        data = self.get(loop_id)  # preserve loop-owned cursor keys
+        data["last_run"] = epoch_now()
+        data["last_status"] = status
+        data["last_duration_s"] = duration_s
+        write_json(self.paths.state_path(loop_id), data)
+
+
+# ---------------------------------------------------------------------------
+# Due-ness. Missed windows coalesce: last_run is stamped after each run, so any
+# number of missed windows is exactly ONE catch-up run.
+# ---------------------------------------------------------------------------
+
+def is_due(last_run, interval_minutes):
+    last = iso_or_epoch_to_epoch(last_run)
+    if last is None:
+        return True
+    try:
+        interval = int(interval_minutes)
+    except (TypeError, ValueError):
+        interval = 0
+    delta = epoch_now() - last
+    if delta < 0:
+        return False
+    return delta >= interval * 60
+
+
+# ---------------------------------------------------------------------------
+# Lock: hold an OS advisory lock for the whole pass. A live holder is the
+# kernel's own truth - no mtime/pid-age guessing, so a long-running loop is
+# never trampled by the next wake.
+# ---------------------------------------------------------------------------
+
+class Lock:
+    def __init__(self, paths):
+        self.paths = paths
+        self.lockfile = paths.lock_dir / "runner.lock"
+        self._fh = None
+
+    def acquire(self):
+        import fcntl
+        self.paths.lock_dir.mkdir(parents=True, exist_ok=True)
+        self._fh = open(self.lockfile, "a+")
+        try:
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            holder = self._read_holder()
+            log_stderr("another runner%s holds the lock; skipping this run"
+                       % ((" (pid %s)" % holder) if holder else ""))
+            self._fh.close()
+            self._fh = None
+            return False
+        self._fh.seek(0)
+        self._fh.truncate()
+        self._fh.write("%d\n" % os.getpid())
+        self._fh.flush()
+        log_stderr("acquired lock")
+        return True
+
+    def _read_holder(self):
+        try:
+            with open(self.lockfile) as fh:
+                return fh.read().strip()
+        except OSError:
+            return ""
+
+    def release(self):
+        if self._fh is None:
+            return
+        import fcntl
+        try:
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        self._fh.close()
+        self._fh = None
+        log_stderr("released lock")
+
+
+# ---------------------------------------------------------------------------
+# Backend: resolve and invoke claude / codex, with the test seam
+# ---------------------------------------------------------------------------
+
+class Backend:
+    def __init__(self, config):
+        self.config = config
+
+    def resolve_bin(self, backend):
+        if backend == "claude":
+            name, cfg_key = "claude", "claude_bin"
+        elif backend == "codex":
+            name, cfg_key = "codex", "codex_bin"
+        else:
+            die("unknown backend '%s' (expected: claude or codex)" % backend, code=127)
+        pinned = self.config.get(cfg_key, "")
+        if pinned and os.access(pinned, os.X_OK):
+            return pinned
+        found = shutil.which(name)
+        if found:
+            return found
+        return self._login_shell_lookup(name)
+
+    @staticmethod
+    def _login_shell_lookup(name):
+        shell = os.environ.get("SHELL", "/bin/bash")
+        try:
+            out = subprocess.run([shell, "-l", "-c", "command -v %s" % name],
+                                 capture_output=True, text=True, timeout=15)
+            path = out.stdout.strip().splitlines()[0] if out.stdout.strip() else ""
+            if path and os.access(path, os.X_OK):
+                return path
+        except (OSError, subprocess.SubprocessError, IndexError):
+            pass
+        return None
+
+    def build_argv(self, bin_path, backend, prompt, tools, cwd, add_dirs):
+        if backend == "claude":
+            argv = [bin_path, "-p", prompt, "--allowedTools", tools, "--add-dir", cwd]
+            for d in add_dirs:
+                if d:
+                    argv += ["--add-dir", d]
+            argv += ["--output-format", "text"]
+            return argv
+        if backend == "codex":
+            return [bin_path, "exec", prompt, "--cd", cwd,
+                    "--sandbox", "workspace-write", "--ask-for-approval", "never"]
+        die("cannot build argv for unknown backend '%s'" % backend, code=2)
+
+    def preview(self, backend, bin_path, tools, cwd, add_dirs):
+        if backend == "claude":
+            extra = "".join(" --add-dir '%s'" % d for d in add_dirs if d)
+            return ("%s -p '<prompt>' --allowedTools '%s' --add-dir '%s'%s "
+                    "--output-format text" % (bin_path, tools, cwd, extra))
+        if backend == "codex":
+            return ("%s exec '<prompt>' --cd '%s' --sandbox workspace-write "
+                    "--ask-for-approval never" % (bin_path, cwd))
+        return "(unknown backend %s)" % backend
+
+    def exec(self, backend, prompt, tools, cwd, add_dirs, log_fh, timeout_s):
+        seam = os.environ.get("CLAUDECRON_TEST_BACKEND_CMD")
+        if seam:
+            return self._exec_seam(seam, backend, prompt, tools, cwd, log_fh, timeout_s)
+        bin_path = self.resolve_bin(backend)
+        if not bin_path:
+            log_fh.write("backend '%s' binary not found on PATH\n" % backend)
+            log_fh.flush()
+            return 127
+        argv = self.build_argv(bin_path, backend, prompt, tools, cwd, add_dirs)
+        return self._run(argv, cwd, log_fh, timeout_s, env=None)
+
+    def _exec_seam(self, seam, backend, prompt, tools, cwd, log_fh, timeout_s):
+        env = dict(os.environ)
+        env["CLAUDECRON_TEST_CWD"] = cwd
+        env["CLAUDECRON_TEST_BACKEND"] = backend
+        env["CLAUDECRON_TEST_TOOLS"] = tools
+        argv = ["sh", "-c", seam, "--", prompt]  # prompt on stdin AND as $1
+        return self._run(argv, cwd, log_fh, timeout_s, env=env, stdin_text=prompt)
+
+    @staticmethod
+    def _run(argv, cwd, log_fh, timeout_s, env=None, stdin_text=None):
+        stdin = subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL
+        try:
+            proc = subprocess.Popen(
+                argv, cwd=cwd if os.path.isdir(cwd) else None,
+                stdin=stdin, stdout=log_fh, stderr=subprocess.STDOUT,
+                env=env, start_new_session=True,
+            )
+        except OSError as exc:
+            log_fh.write("failed to start backend: %s\n" % exc)
+            log_fh.flush()
+            return 127
+        try:
+            # Popen is in bytes mode (stdout is a raw text file handle we opened),
+            # so feed the prompt as encoded bytes.
+            stdin_bytes = stdin_text.encode("utf-8") if stdin_text is not None else None
+            proc.communicate(input=stdin_bytes,
+                             timeout=(timeout_s if timeout_s and timeout_s > 0 else None))
+            return proc.returncode
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                proc.wait()
+            return 124
+
+
+# ---------------------------------------------------------------------------
+# Runner
+# ---------------------------------------------------------------------------
+
+class Runner:
+    def __init__(self, paths, config, registry, state, backend):
+        self.paths = paths
+        self.config = config
+        self.registry = registry
+        self.state = state
+        self.backend = backend
+
+    @staticmethod
+    def field(loop, key, default):
+        val = loop.get(key)
+        return default if val is None else val
+
+    def truncate_log(self, path, keep):
+        try:
+            keep = int(keep)
+        except (TypeError, ValueError):
+            keep = DEFAULT_LOG_KEEP_LINES
+        if not path.exists():
+            return
+        try:
+            with open(path) as fh:
+                lines = fh.readlines()
+            if len(lines) > keep:
+                atomic_write(path, "".join(lines[-keep:]))
+        except OSError:
+            pass
+
+    def notify_failure(self, loop_id, backend, rc, dur, loop_log):
+        cmd = self.config.get("on_failure_cmd", "")
+        if not cmd:
+            return
+        tail = ""
+        try:
+            with open(loop_log) as fh:
+                tail = "".join(fh.readlines()[-20:])
+        except OSError:
+            pass
+        self.paths.runner_log_write("notify id=%s firing on_failure_cmd" % loop_id)
+        env = dict(os.environ)
+        env.update({
+            "CLAUDECRON_LOOP_ID": loop_id,
+            "CLAUDECRON_BACKEND": backend,
+            "CLAUDECRON_RESULT": "error",
+            "CLAUDECRON_RC": str(rc),
+            "CLAUDECRON_DURATION_S": str(dur),
+            "CLAUDECRON_LOOP_LOG": str(loop_log),
+            "CLAUDECRON_HOST": self.paths.host,
+            "CLAUDECRON_LOG_TAIL": tail,
+        })
+        try:
+            with open(self.paths.runner_log, "a") as rl:
+                subprocess.run(["sh", "-c", cmd], stdin=subprocess.DEVNULL,
+                               stdout=rl, stderr=subprocess.STDOUT, env=env)
+        except (OSError, subprocess.SubprocessError):
+            self.paths.runner_log_write(
+                "notify id=%s on_failure_cmd exited non-zero (ignored)" % loop_id)
+
+    def run_one(self, loop, force, dry_run, log_keep):
+        loop_id = loop.get("id")
+        # enabled defaults to True only when absent/None, NEVER treating the
+        # boolean False as "use the default" (the historical jq `// true` bug).
+        enabled = loop.get("enabled")
+        enabled = True if enabled is None else bool(enabled)
+        interval = self.field(loop, "interval_minutes", DEFAULT_INTERVAL_MINUTES)
+        cwd = self.field(loop, "cwd", ".")
+        tools = self.field(loop, "allowed_tools", DEFAULT_ALLOWED_TOOLS)
+        prompt_file = loop.get("prompt_file") or ("prompts/%s.md" % loop_id)
+        backend = self.field(loop, "backend", DEFAULT_BACKEND)
+        add_dirs = loop.get("add_dirs") or []
+
+        prompt_path = (Path(prompt_file) if os.path.isabs(prompt_file)
+                       else self.paths.home / prompt_file)
+        loop_log = self.paths.loop_log(loop_id)
+
+        if not enabled and not force:
+            self.paths.runner_log_write("skip id=%s reason=disabled" % loop_id)
+            return
+
+        last = self.state.last_run_epoch(loop_id)
+        last_disp = "never" if last is None else str(last)
+        if force:
+            self.paths.runner_log_write("due id=%s forced=1" % loop_id)
+        elif is_due(last, interval):
+            self.paths.runner_log_write(
+                "due id=%s last=%s interval=%sm" % (loop_id, last_disp, interval))
+        else:
+            self.paths.runner_log_write(
+                "skip id=%s reason=not-due last=%s interval=%sm"
+                % (loop_id, last_disp, interval))
+            return
+
+        if dry_run:
+            bin_preview = self.backend.resolve_bin(backend) or ("<%s-not-found>" % backend)
+            sys.stderr.write("DRY-RUN loop=%s backend=%s cwd=%s prompt=%s\n"
+                             % (loop_id, backend, cwd, prompt_path))
+            sys.stderr.write("  command: %s\n"
+                             % self.backend.preview(backend, bin_preview, tools, cwd, add_dirs))
+            self.paths.runner_log_write("dry-run id=%s backend=%s" % (loop_id, backend))
+            return
+
+        if not (prompt_path.is_file() and os.access(prompt_path, os.R_OK)):
+            self.paths.runner_log_write(
+                "status id=%s result=error reason=prompt-missing path=%s"
+                % (loop_id, prompt_path))
+            self.state.record_run(loop_id, "error", 0)
+            return
+        prompt = prompt_path.read_text()
+
+        self.paths.runner_log_write(
+            "run id=%s backend=%s cwd=%s" % (loop_id, backend, cwd))
+
+        timeout_s = os.environ.get("CLAUDECRON_RUN_TIMEOUT_S")
+        if timeout_s is None or timeout_s == "":
+            timeout_s = self.config.get("run_timeout_s", 0)
+        try:
+            timeout_s = int(timeout_s)
+        except (TypeError, ValueError):
+            timeout_s = 0
+
+        start = epoch_now()
+        self.paths.logs.mkdir(parents=True, exist_ok=True)
+        with open(loop_log, "a") as log_fh:
+            log_fh.write("%s ----- run start id=%s backend=%s -----\n"
+                         % (now_iso(), loop_id, backend))
+            log_fh.flush()
+            rc = self.backend.exec(backend, prompt, tools, cwd, add_dirs, log_fh, timeout_s)
+            log_fh.write("%s ----- run end id=%s rc=%s dur=%ss -----\n"
+                         % (now_iso(), loop_id, rc, epoch_now() - start))
+            if rc == 124:
+                log_fh.write("%s ----- run TIMED OUT id=%s after %ss -----\n"
+                             % (now_iso(), loop_id, timeout_s))
+        dur = max(0, epoch_now() - start)
+        self.truncate_log(loop_log, log_keep)
+
+        if rc == 124:
+            self.paths.runner_log_write("timeout id=%s after=%ss" % (loop_id, timeout_s))
+
+        if rc == 0:
+            self.state.record_run(loop_id, "ok", dur)
+            self.paths.runner_log_write("status id=%s result=ok dur=%ss" % (loop_id, dur))
+        else:
+            self.state.record_run(loop_id, "error", dur)
+            self.paths.runner_log_write(
+                "status id=%s result=error rc=%s dur=%ss" % (loop_id, rc, dur))
+            self.notify_failure(loop_id, backend, rc, dur, loop_log)
+
+    def run_pass(self, wake=False, dry_run=False, force=False, only_id=None):
+        lock = None
+        if not dry_run:
+            lock = Lock(self.paths)
+            if not lock.acquire():
+                return 0
+        try:
+            self.paths.mkdirs()
+            self.registry.ensure()
+            self.config.ensure()
+            log_keep = self.config.get("log_keep_lines", DEFAULT_LOG_KEEP_LINES)
+            self.paths.runner_log_write(
+                "wake source=%s host=%s" % ("scheduler" if wake else "cli", self.paths.host))
+            # Materialize the loop list up front; nothing a backend does to its
+            # own stdin can affect our iteration (the historical starvation bug).
+            loops = list(self.registry.loops())
+            count = 0
+            for loop in loops:
+                if only_id is not None and loop.get("id") != only_id:
+                    continue
+                count += 1
+                self.run_one(loop, force, dry_run, log_keep)
+            if only_id is not None and count == 0:
+                die("no loop with id '%s' in registry" % only_id)
+            self.paths.runner_log_write(
+                "wake done host=%s processed=%d" % (self.paths.host, count))
+            return 0
+        finally:
+            if lock is not None:
+                lock.release()
+
+
+# ---------------------------------------------------------------------------
+# Scheduler
+# ---------------------------------------------------------------------------
+
+class Scheduler:
+    def __init__(self, paths, self_bin):
+        self.paths = paths
+        self.self_bin = self_bin
+        home = os.environ.get("HOME", "")
+        self.launchd_plist = Path(home) / "Library" / "LaunchAgents" / ("%s.plist" % SCHED_LABEL)
+        xdg = os.environ.get("XDG_CONFIG_HOME") or (home + "/.config")
+        self.systemd_dir = Path(xdg) / "systemd" / "user"
+        self.systemd_service = self.systemd_dir / ("%s.service" % SCHED_LABEL)
+        self.systemd_timer = self.systemd_dir / ("%s.timer" % SCHED_LABEL)
+        self.cron_begin = "# >>> %s >>>" % SCHED_LABEL
+        self.cron_end = "# <<< %s <<<" % SCHED_LABEL
+        try:
+            self.tick_minutes = max(1, int(os.environ.get("CLAUDECRON_TICK_MINUTES", "1")))
+        except ValueError:
+            self.tick_minutes = 1
+
+    def detect(self):
+        try:
+            osname = subprocess.run(["uname", "-s"], capture_output=True, text=True).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            osname = ""
+        if osname == "Darwin":
+            return "launchd"
+        if osname == "Linux" and shutil.which("systemctl"):
+            if subprocess.run(["systemctl", "--user", "show-environment"],
+                              capture_output=True).returncode == 0:
+                return "systemd"
+        if shutil.which("crontab"):
+            return "cron"
+        return "none"
+
+    def resolve_path(self):
+        login = ""
+        shell = os.environ.get("SHELL", "/bin/bash")
+        try:
+            login = subprocess.run([shell, "-l", "-c", 'printf %s "$PATH"'],
+                                   capture_output=True, text=True, timeout=15).stdout
+        except (OSError, subprocess.SubprocessError):
+            login = ""
+        home = os.environ.get("HOME", "")
+        known = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:%s/.local/bin" % home
+        out = []
+        for seg in ("%s:%s" % (login, known)).split(":"):
+            if seg and seg not in out:
+                out.append(seg)
+        return ":".join(out)
+
+    def tick_seconds(self):
+        return max(1, self.tick_minutes * 60)
+
+    def launchd_plist_body(self):
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+            '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+            '<plist version="1.0">\n<dict>\n'
+            '  <key>Label</key>\n  <string>%s</string>\n'
+            '  <key>ProgramArguments</key>\n  <array>\n'
+            '    <string>%s</string>\n    <string>run</string>\n    <string>--wake</string>\n'
+            '  </array>\n'
+            '  <key>EnvironmentVariables</key>\n  <dict>\n'
+            '    <key>PATH</key>\n    <string>%s</string>\n'
+            '    <key>CLAUDECRON_HOME</key>\n    <string>%s</string>\n  </dict>\n'
+            '  <key>StartInterval</key>\n  <integer>%d</integer>\n'
+            '  <key>RunAtLoad</key>\n  <true/>\n'
+            '  <key>ProcessType</key>\n  <string>Background</string>\n'
+            '  <key>LowPriorityIO</key>\n  <true/>\n'
+            '  <key>StandardOutPath</key>\n  <string>%s</string>\n'
+            '  <key>StandardErrorPath</key>\n  <string>%s</string>\n'
+            '</dict>\n</plist>\n'
+            % (SCHED_LABEL, self.self_bin, self.resolve_path(), self.paths.home,
+               self.tick_seconds(), self.paths.runner_log, self.paths.runner_log)
+        )
+
+    def systemd_service_body(self):
+        return (
+            "[Unit]\nDescription=claudecron runner (%s)\n\n"
+            "[Service]\nType=oneshot\nEnvironment=PATH=%s\n"
+            "Environment=CLAUDECRON_HOME=%s\nExecStart=%s run --wake\n"
+            % (SCHED_LABEL, self.resolve_path(), self.paths.home, self.self_bin)
+        )
+
+    def systemd_timer_body(self):
+        return (
+            "[Unit]\nDescription=claudecron runner timer (%s)\n\n"
+            "[Timer]\nOnBootSec=%d\nOnUnitActiveSec=%d\nAccuracySec=15\n"
+            "Persistent=true\n\n[Install]\nWantedBy=timers.target\n"
+            % (SCHED_LABEL, self.tick_seconds(), self.tick_seconds())
+        )
+
+    def install(self, which=None):
+        which = which or self.detect()
+        self.paths.mkdirs()
+        if which == "launchd":
+            self._install_launchd()
+        elif which == "systemd":
+            self._install_systemd()
+        elif which == "cron":
+            self._install_cron()
+        elif which == "none":
+            die("no supported scheduler found (launchd/systemd/cron all unavailable).", code=1)
+        else:
+            die("unknown scheduler '%s'" % which, code=2)
+        if self.verify(which):
+            log_stderr("scheduler '%s' installed and verified" % which)
+        else:
+            log_stderr("scheduler '%s' installed but not confirmed; check logs" % which)
+
+    @staticmethod
+    def _run(argv):
+        try:
+            return subprocess.run(argv, capture_output=True).returncode
+        except (OSError, subprocess.SubprocessError):
+            return 1
+
+    def _install_launchd(self):
+        self.launchd_plist.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(self.launchd_plist, self.launchd_plist_body())
+        domain = "gui/%d" % os.getuid()
+        target = "%s/%s" % (domain, SCHED_LABEL)
+        self._run(["launchctl", "bootout", target])
+        if self._run(["launchctl", "bootstrap", domain, str(self.launchd_plist)]) == 0:
+            log_stderr("launchd: bootstrapped %s" % SCHED_LABEL)
+        else:
+            self._run(["launchctl", "unload", str(self.launchd_plist)])
+            self._run(["launchctl", "load", str(self.launchd_plist)])
+            log_stderr("launchd: loaded %s (legacy load path)" % SCHED_LABEL)
+        self._run(["launchctl", "enable", target])
+        self._run(["launchctl", "kickstart", "-k", target])
+
+    def _uninstall_launchd(self):
+        target = "gui/%d/%s" % (os.getuid(), SCHED_LABEL)
+        self._run(["launchctl", "bootout", target])
+        self._run(["launchctl", "unload", str(self.launchd_plist)])
+        try:
+            self.launchd_plist.unlink()
+        except OSError:
+            pass
+        log_stderr("launchd: removed %s" % SCHED_LABEL)
+
+    def _verify_launchd(self):
+        if self._run(["launchctl", "print", "gui/%d/%s" % (os.getuid(), SCHED_LABEL)]) == 0:
+            return True
+        try:
+            out = subprocess.run(["launchctl", "list"], capture_output=True, text=True).stdout
+            return SCHED_LABEL in out
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    def _install_systemd(self):
+        self.systemd_dir.mkdir(parents=True, exist_ok=True)
+        atomic_write(self.systemd_service, self.systemd_service_body())
+        atomic_write(self.systemd_timer, self.systemd_timer_body())
+        self._run(["systemctl", "--user", "daemon-reload"])
+        self._run(["systemctl", "--user", "enable", "--now", "%s.timer" % SCHED_LABEL])
+        self._run(["loginctl", "enable-linger", self._username()])
+        log_stderr("systemd: enabled %s.timer" % SCHED_LABEL)
+
+    def _uninstall_systemd(self):
+        self._run(["systemctl", "--user", "disable", "--now", "%s.timer" % SCHED_LABEL])
+        self._run(["systemctl", "--user", "stop", "%s.service" % SCHED_LABEL])
+        for p in (self.systemd_timer, self.systemd_service):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        self._run(["systemctl", "--user", "daemon-reload"])
+        log_stderr("systemd: removed %s units" % SCHED_LABEL)
+
+    def _verify_systemd(self):
+        try:
+            out = subprocess.run(["systemctl", "--user", "list-timers", "--all"],
+                                 capture_output=True, text=True).stdout
+            if ("%s.timer" % SCHED_LABEL) in out:
+                return True
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return self._run(["systemctl", "--user", "is-enabled", "%s.timer" % SCHED_LABEL]) == 0
+
+    @staticmethod
+    def _username():
+        try:
+            import getpass
+            return getpass.getuser()
+        except Exception:
+            return os.environ.get("USER", "")
+
+    def _cron_block(self):
+        return "\n".join([
+            self.cron_begin,
+            "PATH=%s" % self.resolve_path(),
+            "CLAUDECRON_HOME=%s" % self.paths.home,
+            "*/%d * * * * %s run --wake >> %s 2>&1"
+            % (self.tick_minutes, self.self_bin, self.paths.runner_log),
+            self.cron_end,
+            "",
+        ])
+
+    def _current_crontab_without_block(self):
+        try:
+            out = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout
+        except (OSError, subprocess.SubprocessError):
+            out = ""
+        lines, skip = [], False
+        for line in out.splitlines():
+            if line == self.cron_begin:
+                skip = True
+                continue
+            if line == self.cron_end:
+                skip = False
+                continue
+            if not skip:
+                lines.append(line)
+        return lines
+
+    def _install_cron(self):
+        content = "\n".join(self._current_crontab_without_block()) + "\n" + self._cron_block()
+        self._crontab_replace(content)
+        log_stderr("cron: installed managed block for %s" % SCHED_LABEL)
+
+    def _uninstall_cron(self):
+        content = "\n".join(self._current_crontab_without_block()) + "\n"
+        self._crontab_replace(content)
+        log_stderr("cron: removed managed block for %s" % SCHED_LABEL)
+
+    def _crontab_replace(self, content):
+        try:
+            p = subprocess.Popen(["crontab", "-"], stdin=subprocess.PIPE, text=True)
+            p.communicate(content)
+        except (OSError, subprocess.SubprocessError):
+            log_stderr("cron: failed to install crontab")
+
+    def _verify_cron(self):
+        try:
+            out = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout
+            return SCHED_LABEL in out
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    def verify(self, which=None):
+        which = which or self.detect()
+        return {"launchd": self._verify_launchd, "systemd": self._verify_systemd,
+                "cron": self._verify_cron}.get(which, lambda: False)()
+
+    def uninstall(self):
+        if shutil.which("launchctl"):
+            self._uninstall_launchd()
+        else:
+            try:
+                self.launchd_plist.unlink()
+            except OSError:
+                pass
+        if shutil.which("systemctl"):
+            self._uninstall_systemd()
+        else:
+            for p in (self.systemd_timer, self.systemd_service):
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+        if shutil.which("crontab"):
+            self._uninstall_cron()
+        log_stderr("uninstalled scheduler from all backends")
+
+    def init_config(self, config):
+        for name, key in (("claude", "claude_bin"), ("codex", "codex_bin")):
+            found = shutil.which(name)
+            if found:
+                config.set(key, found)
+
+    def last_wake(self):
+        if self.paths.runner_log.exists():
+            try:
+                lines = self.paths.runner_log.read_text().splitlines()
+                return lines[-1] if lines else ""
+            except OSError:
+                return ""
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Skills
+# ---------------------------------------------------------------------------
+
+class Skills:
+    def __init__(self, libexec):
+        self.src = Path(libexec) / "skills"
+        home = os.environ.get("HOME", "")
+        self.claude_dir = Path(os.environ.get("CLAUDECRON_CLAUDE_SKILLS_DIR",
+                                              home + "/.claude/skills"))
+        self.codex_dir = Path(os.environ.get("CLAUDECRON_CODEX_PROMPTS_DIR",
+                                             home + "/.codex/prompts"))
+
+    def install(self):
+        home = Path(os.environ.get("HOME", ""))
+        if (home / ".claude").exists():
+            for name in ("claudecron", "claudecron-status"):
+                s = self.src / name
+                if s.is_dir():
+                    d = self.claude_dir / name
+                    if d.exists():
+                        shutil.rmtree(d, ignore_errors=True)
+                    self.claude_dir.mkdir(parents=True, exist_ok=True)
+                    shutil.copytree(s, d)
+                    log_stderr("skills: installed %s -> %s" % (name, d))
+        codex_src = self.src / "codex-claudecron" / "AGENTS.md"
+        if (home / ".codex").exists() and codex_src.is_file():
+            self.codex_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy(codex_src, self.codex_dir / "claudecron.md")
+            log_stderr("skills: installed codex prompt -> %s" % (self.codex_dir / "claudecron.md"))
+
+    def remove(self):
+        for name in ("claudecron", "claudecron-status"):
+            shutil.rmtree(self.claude_dir / name, ignore_errors=True)
+        try:
+            (self.codex_dir / "claudecron.md").unlink()
+        except OSError:
+            pass
+        log_stderr("skills: removed")
+
+    def status(self):
+        print("claude skills dir: %s" % self.claude_dir)
+        print("codex prompts dir: %s" % self.codex_dir)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def libexec_root():
+    # bin/claudecron lives in <libexec>/bin/, so libexec is the parent's parent.
+    return Path(__file__).resolve().parent.parent
+
+
+def read_version():
+    try:
+        return (libexec_root() / "VERSION").read_text().strip() or VERSION_FALLBACK
+    except OSError:
+        return VERSION_FALLBACK
+
+
+def human_next_due(state, loop_id, interval):
+    last = state.last_run_epoch(loop_id)
+    if last is None:
+        return "now"
+    due = last + int(interval) * 60
+    now = epoch_now()
+    if now >= due:
+        return "now"
+    return "in %dm" % ((due - now + 59) // 60)
+
+
+def cmd_init(args, ctx):
+    paths, config, registry = ctx["paths"], ctx["config"], ctx["registry"]
+    paths.mkdirs()
+    log_stderr("data home: %s" % paths.home)
+    config.ensure()
+    if args.backend:
+        if args.backend not in ("claude", "codex"):
+            die("init: --backend must be 'claude' or 'codex' (got '%s')" % args.backend)
+        config.set("backend", args.backend)
+        log_stderr("backend set to %s" % args.backend)
+    registry.ensure()
+    if args.no_scheduler or os.environ.get("CLAUDECRON_INIT_SCHEDULER") == "0":
+        log_stderr("skipping scheduler install")
+    else:
+        sched = ctx["scheduler"]()
+        which = sched.detect()
+        log_stderr("detected scheduler: %s" % which)
+        if which == "none":
+            log_stderr("no supported scheduler found; run loops manually with 'claudecron run'")
+        else:
+            sched.init_config(config)
+            sched.install(which)
+    if args.no_skills:
+        log_stderr("skipping skills install")
+    else:
+        ctx["skills"]().install()
+    log_stderr("init complete. add a loop with: claudecron add <id>")
+
+
+def cmd_add(args, ctx):
+    paths, config, registry = ctx["paths"], ctx["config"], ctx["registry"]
+    loop_id = args.id
+    validate_id(loop_id)
+    if registry.exists(loop_id) and not args.force:
+        die("loop '%s' already exists; pass --force to overwrite" % loop_id)
+    sources = sum(1 for x in (args.prompt, args.prompt_file, args.stdin) if x)
+    scripted = any([args.interval, args.cwd, args.tools, args.backend, args.prompt,
+                    args.prompt_file, args.stdin, args.add_dir, args.enabled, args.disabled])
+    if not scripted:
+        die("add: interactive mode needs a TTY; pass --interval/--cwd/--tools/--prompt(-file)")
+    if sources > 1:
+        die("add: choose only one of --prompt, --prompt-file, or - (stdin)")
+    interval = parse_interval(args.interval or DEFAULT_INTERVAL_MINUTES)
+    cwd = args.cwd or os.getcwd()
+    if not args.cwd:
+        log_stderr("no --cwd given; defaulting to %s" % cwd)
+    if not cwd.startswith("/"):
+        die("add: --cwd must be an absolute path (got '%s')" % cwd)
+    for d in (args.add_dir or []):
+        if not d.startswith("/"):
+            die("add: --add-dir must be absolute (got '%s')" % d)
+    tools = args.tools or ADD_DEFAULT_ALLOWED_TOOLS
+    backend = args.backend or config.get("backend", "claude")
+    if backend not in ("claude", "codex"):
+        die("add: backend must be 'claude' or 'codex' (got '%s')" % backend)
+    if args.prompt:
+        prompt_content = args.prompt
+    elif args.prompt_file:
+        if not os.path.isfile(args.prompt_file):
+            die("add: prompt file not found: %s" % args.prompt_file)
+        prompt_content = Path(args.prompt_file).read_text()
+    elif args.stdin:
+        prompt_content = sys.stdin.read()
+    else:
+        die("add: empty prompt; provide --prompt, --prompt-file, or - (stdin)")
+    if not prompt_content:
+        die("add: empty prompt; provide --prompt, --prompt-file, or - (stdin)")
+    prompt_rel = "prompts/%s.md" % loop_id
+    paths.prompts.mkdir(parents=True, exist_ok=True)
+    atomic_write(paths.home / prompt_rel,
+                 prompt_content if prompt_content.endswith("\n") else prompt_content + "\n")
+    log_stderr("wrote prompt: %s" % (paths.home / prompt_rel))
+    enabled = False if args.disabled else True
+    registry.upsert({
+        "id": loop_id,
+        "enabled": enabled,
+        "interval_minutes": interval,
+        "cwd": cwd,
+        "add_dirs": args.add_dir or [],
+        "allowed_tools": tools,
+        "prompt_file": prompt_rel,
+        "backend": backend,
+    })
+    log_stderr("added loop '%s' (interval %dm, backend %s, enabled=%s)"
+               % (loop_id, interval, backend, str(enabled).lower()))
+    log_stderr("it will NOT run until the scheduler fires; test now with: claudecron run --now %s"
+               % loop_id)
+
+
+def cmd_list(args, ctx):
+    ids = [x.get("id") for x in ctx["registry"].loops()]
+    if args.json or ctx["json"]:
+        print(json.dumps(ids))
+        return
+    if not ids:
+        log_stderr("no loops yet; add one with: claudecron add <id>")
+        return
+    for i in ids:
+        print(i)
+
+
+def cmd_status(args, ctx):
+    registry, state = ctx["registry"], ctx["state"]
+    loops = registry.loops()
+    if args.json or ctx["json"]:
+        out = []
+        for loop in loops:
+            st = state.get(loop.get("id"))
+            out.append({
+                "id": loop.get("id"),
+                "enabled": loop.get("enabled"),
+                "interval_minutes": loop.get("interval_minutes"),
+                "backend": loop.get("backend"),
+                "last_run": st.get("last_run") or "",
+                "last_status": st.get("last_status") or "",
+            })
+        print(json.dumps(out))
+        return
+    if not loops:
+        log_stderr("no loops registered")
+        return
+    hdr = "%-20s %-8s %-9s %-8s %-20s %-9s %s"
+    print(hdr % ("ID", "ENABLED", "INTERVAL", "BACKEND", "LAST_RUN", "STATUS", "NEXT_DUE"))
+    print(hdr % ("-" * 20, "-" * 8, "-" * 9, "-" * 8, "-" * 20, "-" * 9, "-" * 8))
+    for loop in loops:
+        lid = loop.get("id")
+        st = state.get(lid)
+        interval = loop.get("interval_minutes", DEFAULT_INTERVAL_MINUTES)
+        last_run = st.get("last_run")
+        last_run = str(last_run) if last_run not in (None, "") else "-"
+        last_status = st.get("last_status") or "-"
+        print(hdr % (lid, str(loop.get("enabled")).lower(), "%sm" % interval,
+                     loop.get("backend"), last_run, last_status,
+                     human_next_due(state, lid, interval)))
+
+
+def cmd_run(args, ctx):
+    runner = ctx["runner"]
+    if args.now:
+        validate_id(args.now)
+        if not ctx["registry"].exists(args.now):
+            die("run: no such loop '%s'" % args.now)
+        log_stderr("forcing run of '%s' (ignoring due/enabled)" % args.now)
+        return runner.run_pass(force=True, only_id=args.now, dry_run=args.dry_run)
+    log_stderr("starting due pass on %s" % ctx["paths"].host)
+    return runner.run_pass(wake=True, dry_run=args.dry_run)
+
+
+def cmd_logs(args, ctx):
+    paths = ctx["paths"]
+    lines = args.lines if args.lines else 200
+    if args.runner:
+        target = paths.runner_log
+    else:
+        if not args.id:
+            die("logs: missing <id> (or pass --runner for the runner log)")
+        validate_id(args.id)
+        target = paths.loop_log(args.id)
+    if not target.exists():
+        log_stderr("no log yet at %s" % target)
+        return
+    argv = ["tail", "-n", str(lines)] + (["-f"] if args.follow else []) + [str(target)]
+    os.execvp("tail", argv)
+
+
+def cmd_enable(args, ctx):
+    _toggle(True, args, ctx)
+
+
+def cmd_disable(args, ctx):
+    _toggle(False, args, ctx)
+
+
+def _toggle(want, args, ctx):
+    verb = "enable" if want else "disable"
+    if args.scheduler:
+        sched = ctx["scheduler"]()
+        if want:
+            sched.install()
+            log_stderr("scheduler enabled")
+        else:
+            sched.uninstall()
+            log_stderr("scheduler disabled (loops will not fire until re-enabled)")
+        return
+    if not args.id:
+        die("%s: missing <id> (or pass --scheduler)" % verb)
+    validate_id(args.id)
+    registry = ctx["registry"]
+    loop = registry.get(args.id)
+    if loop is None:
+        die("%s: no such loop '%s'" % (verb, args.id))
+    loop["enabled"] = want
+    registry.upsert(loop)
+    log_stderr("loop '%s' %sd" % (args.id, verb))
+
+
+def cmd_remove(args, ctx):
+    paths, registry = ctx["paths"], ctx["registry"]
+    if not args.id:
+        die("remove: missing <id>")
+    validate_id(args.id)
+    if not registry.exists(args.id):
+        die("remove: no such loop '%s'" % args.id)
+    if not args.yes:
+        suffix = " and PURGE its prompt+state" if args.purge else ""
+        sys.stderr.write('Remove loop "%s"%s? [y/N]: ' % (args.id, suffix))
+        try:
+            ans = sys.stdin.readline().strip()
+        except (OSError, KeyboardInterrupt):
+            ans = ""
+        if ans not in ("y", "Y", "yes", "YES"):
+            log_stderr("aborted")
+            return
+    registry.remove(args.id)
+    log_stderr("removed registry entry '%s'" % args.id)
+    if args.purge:
+        pf = paths.home / ("prompts/%s.md" % args.id)
+        if pf.exists():
+            pf.unlink()
+            log_stderr("purged %s" % pf)
+        if paths.state.exists():
+            for sd in paths.state.iterdir():
+                sfile = sd / ("%s.json" % args.id)
+                if sfile.exists():
+                    sfile.unlink()
+                    log_stderr("purged %s" % sfile)
+
+
+def cmd_doctor(args, ctx):
+    paths, config = ctx["paths"], ctx["config"]
+    fails = [0]
+
+    def ok(m):
+        print("  [ OK ] %s" % m)
+
+    def warn(m):
+        print("  [WARN] %s" % m)
+
+    def fail(m):
+        print("  [FAIL] %s" % m)
+        fails[0] += 1
+
+    print("claudecron doctor (%s)" % read_version())
+    print("home: %s" % paths.home)
+    print("libexec: %s\n" % libexec_root())
+    print("environment:")
+    ok("python %d.%d.%d" % sys.version_info[:3])
+    backend = ctx["backend"]
+    cfg_backend = config.get("backend", "claude")
+    print("\nbackends:")
+    print("  configured backend: %s" % cfg_backend)
+    for name in ("claude", "codex"):
+        b = backend.resolve_bin(name)
+        if b:
+            ok("%s -> %s" % (name, b))
+        elif cfg_backend == name:
+            fail("%s backend not resolved; set %s_bin in config.json or add it to PATH"
+                 % (name, name))
+        else:
+            warn("%s backend not resolved (not the active backend)" % name)
+    print("\nregistry:")
+    if not paths.registry.exists():
+        warn("no registry yet at %s; run 'claudecron init'" % paths.registry)
+    else:
+        ok("registry valid (%d loop(s))" % len(ctx["registry"].loops()))
+    print("\nconfig:")
+    ok("config valid" if paths.config.exists() else "no config yet; run 'claudecron init'")
+    print("\nscheduler:")
+    sched = ctx["scheduler"]()
+    which = sched.detect()
+    print("  type: %s" % which)
+    if sched.verify(which):
+        ok("scheduler unit loaded (%s)" % SCHED_LABEL)
+        lw = sched.last_wake()
+        if lw:
+            print("  last wake: %s" % lw)
+    else:
+        warn("scheduler not loaded; install with 'claudecron scheduler install'")
+    print("")
+    if fails[0]:
+        print("doctor: %d check(s) FAILED." % fails[0])
+        sys.exit(1)
+    print("doctor: all critical checks passed.")
+
+
+def cmd_scheduler(args, ctx):
+    sched = ctx["scheduler"]()
+    if args.action == "install":
+        sched.install()
+    elif args.action == "remove":
+        sched.uninstall()
+    elif args.action == "status":
+        which = sched.detect()
+        print("scheduler: %s" % which)
+        print("loaded: %s" % ("yes" if sched.verify(which) else "no"))
+    else:
+        die("scheduler: unknown action '%s' (install|remove|status)" % args.action)
+
+
+def cmd_skills(args, ctx):
+    skills = ctx["skills"]()
+    action = args.action or "status"
+    if action == "install":
+        skills.install()
+    elif action == "remove":
+        skills.remove()
+    elif action == "status":
+        skills.status()
+    else:
+        die("skills: unknown action '%s' (install|remove|status)" % action)
+
+
+def cmd_uninstall(args, ctx):
+    ctx["scheduler"]().uninstall()
+    ctx["skills"]().remove()
+    if args.purge:
+        shutil.rmtree(ctx["paths"].home, ignore_errors=True)
+        log_stderr("purged data home")
+
+
+def cmd_version(args, ctx):
+    if ctx["json"]:
+        print(json.dumps({"name": "claudecron", "version": read_version(),
+                          "libexec": str(libexec_root())}))
+    else:
+        print("claudecron %s" % read_version())
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="claudecron",
+                                description="run autonomous agent loops on a schedule")
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--config", dest="config_dir")
+    p.add_argument("-q", "--quiet", action="store_true")
+    p.add_argument("-v", "--verbose", action="store_true")
+    sub = p.add_subparsers(dest="command")
+
+    pi = sub.add_parser("init")
+    pi.add_argument("--backend")
+    pi.add_argument("--no-scheduler", action="store_true")
+    pi.add_argument("--no-skills", action="store_true")
+
+    pa = sub.add_parser("add")
+    pa.add_argument("id")
+    pa.add_argument("--interval")
+    pa.add_argument("--cwd")
+    pa.add_argument("--add-dir", action="append", dest="add_dir")
+    pa.add_argument("--tools")
+    pa.add_argument("--backend")
+    pa.add_argument("--prompt")
+    pa.add_argument("--prompt-file")
+    pa.add_argument("-", dest="stdin", action="store_true")
+    pa.add_argument("--enabled", action="store_true")
+    pa.add_argument("--disabled", action="store_true")
+    pa.add_argument("--force", action="store_true")
+
+    for name in ("list", "ls"):
+        pl = sub.add_parser(name)
+        pl.add_argument("--json", action="store_true")
+    for name in ("status", "st"):
+        ps = sub.add_parser(name)
+        ps.add_argument("--json", action="store_true")
+
+    pr = sub.add_parser("run")
+    pr.add_argument("--now")
+    pr.add_argument("--dry-run", action="store_true")
+    pr.add_argument("--backend")
+    pr.add_argument("--wake", action="store_true")
+
+    for name in ("logs", "log"):
+        pg = sub.add_parser(name)
+        pg.add_argument("id", nargs="?")
+        pg.add_argument("-f", "--follow", action="store_true")
+        pg.add_argument("-n", "--lines", type=int)
+        pg.add_argument("--runner", action="store_true")
+
+    for verb in ("enable", "disable"):
+        pe = sub.add_parser(verb)
+        pe.add_argument("id", nargs="?")
+        pe.add_argument("--scheduler", action="store_true")
+
+    for name in ("remove", "rm"):
+        prm = sub.add_parser(name)
+        prm.add_argument("id", nargs="?")
+        prm.add_argument("--purge", action="store_true")
+        prm.add_argument("-y", "--yes", action="store_true")
+
+    sub.add_parser("doctor")
+    sub.add_parser("scheduler").add_argument("action", nargs="?", default="status")
+    sub.add_parser("skills").add_argument("action", nargs="?", default="status")
+    sub.add_parser("uninstall").add_argument("--purge", action="store_true")
+    sub.add_parser("version")
+    return p
+
+
+DISPATCH = {
+    "init": cmd_init, "add": cmd_add, "list": cmd_list, "ls": cmd_list,
+    "status": cmd_status, "st": cmd_status, "run": cmd_run, "logs": cmd_logs,
+    "log": cmd_logs, "enable": cmd_enable, "disable": cmd_disable,
+    "remove": cmd_remove, "rm": cmd_remove, "doctor": cmd_doctor,
+    "scheduler": cmd_scheduler, "skills": cmd_skills, "uninstall": cmd_uninstall,
+    "version": cmd_version,
+}
+
+
+def main(argv):
+    if argv and argv[0] in ("-V", "--version"):
+        print("claudecron %s" % read_version())
+        return 0
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not args.command:
+        parser.print_usage(sys.stderr)
+        return 2
+    paths = Paths(args.config_dir)
+    config = Config(paths)
+    registry = Registry(paths)
+    state = State(paths)
+    backend = Backend(config)
+    runner = Runner(paths, config, registry, state, backend)
+    self_bin = str(Path(__file__).resolve())
+    ctx = {
+        "paths": paths, "config": config, "registry": registry, "state": state,
+        "backend": backend, "runner": runner, "json": args.json,
+        "scheduler": lambda: Scheduler(paths, self_bin),
+        "skills": lambda: Skills(libexec_root()),
+    }
+    handler = DISPATCH.get(args.command)
+    if handler is None:
+        parser.print_usage(sys.stderr)
+        return 2
+    rc = handler(args, ctx)
+    return rc if isinstance(rc, int) else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)

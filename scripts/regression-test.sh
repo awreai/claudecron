@@ -25,6 +25,50 @@ FAIL=0
 t_ok()   { printf 'ok - %s\n' "$1"; PASS=$((PASS + 1)); }
 t_fail() { printf 'not ok - %s\n' "$1"; FAIL=$((FAIL + 1)); }
 
+# JSON helpers (claudecron no longer depends on jq at runtime, so the tests
+# don't either). jget <file> <key> prints a top-level scalar or empty.
+jget() {
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        v = json.load(f).get(sys.argv[2], "")
+except Exception:
+    v = ""
+print("" if v is None else v)
+PY
+}
+# jset_str <file> <key> <string-value> - set a top-level string key in place.
+jset_str() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import json, sys
+p = sys.argv[1]
+try:
+    with open(p) as f:
+        d = json.load(f)
+except Exception:
+    d = {}
+d[sys.argv[2]] = sys.argv[3]
+with open(p, "w") as f:
+    json.dump(d, f, indent=2)
+PY
+}
+# jset_num <file> <key> <number-value> - set a top-level numeric key in place.
+jset_num() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import json, sys
+p = sys.argv[1]
+try:
+    with open(p) as f:
+        d = json.load(f)
+except Exception:
+    d = {}
+d[sys.argv[2]] = int(sys.argv[3])
+with open(p, "w") as f:
+    json.dump(d, f, indent=2)
+PY
+}
+
 # fresh_home - new isolated data home; sets TMP and CLAUDECRON_HOME.
 fresh_home() {
   TMP="$(mktemp -d "${TMPDIR:-/tmp}/claudecron-reg.XXXXXX")"
@@ -77,9 +121,7 @@ cat > /dev/null
 echo fake-claude-output
 EOS
   chmod +x "$TMP/fake-claude"
-  jq --arg b "$TMP/fake-claude" '.claude_bin = $b' "$CLAUDECRON_HOME/config.json" \
-    > "$CLAUDECRON_HOME/config.json.new"
-  mv "$CLAUDECRON_HOME/config.json.new" "$CLAUDECRON_HOME/config.json"
+  jset_str "$CLAUDECRON_HOME/config.json" claude_bin "$TMP/fake-claude"
 
   for id in aaa bbb ccc; do
     "$BIN" add "$id" --interval 1 --cwd "$TMP" --tools Read --backend claude \
@@ -89,7 +131,7 @@ EOS
 
   local all_ok=1
   for id in aaa bbb ccc; do
-    status="$(jq -r '.last_status // empty' "$CLAUDECRON_HOME/state/$HOST/$id.json" 2>/dev/null)"
+    status="$(jget "$CLAUDECRON_HOME/state/$HOST/$id.json" last_status)"
     [ "$status" = "ok" ] || all_ok=0
   done
   if [ "$all_ok" = "1" ]; then
@@ -106,8 +148,9 @@ EOS
 }
 
 # ---------------------------------------------------------------------------
-# 3. a lock held by a LIVE process is never stolen, however old; a lock whose
-#    recorded holder is dead is reclaimed
+# 3. a wake pass never runs while another runner holds the lock; once the
+#    holder releases, the next pass runs. Exercises the real lock end-to-end
+#    by holding the same advisory lock the runner uses from a helper process.
 # ---------------------------------------------------------------------------
 test_live_lock_never_stolen() {
   fresh_home
@@ -115,53 +158,73 @@ test_live_lock_never_stolen() {
   "$BIN" add lk --interval 1 --cwd "$TMP" --tools Read --backend claude \
     --prompt noop >/dev/null 2>&1
 
-  sleep 600 &
-  LIVE_PID=$!
+  # Hold the runner's lockfile from a background helper: flock, signal ready,
+  # then block until told to release. This is the same lock the runner takes,
+  # so a competing 'run' must skip while we hold it.
+  lockfile="$CLAUDECRON_HOME/lock/runner.lock"
   mkdir -p "$CLAUDECRON_HOME/lock"
-  printf '%s\n' "$LIVE_PID" > "$CLAUDECRON_HOME/lock/pid"
-  # Backdate way past any staleness threshold.
-  touch -t 202601010000 "$CLAUDECRON_HOME/lock"
+  ready="$TMP/held.ready"; releasefifo="$TMP/release"
+  mkfifo "$releasefifo"
+  python3 - "$lockfile" "$ready" "$releasefifo" <<'PY' &
+import fcntl, os, sys
+lockfile, ready, releasefifo = sys.argv[1], sys.argv[2], sys.argv[3]
+fh = open(lockfile, "a+")
+fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+open(ready, "w").close()
+open(releasefifo).read()   # block until the test opens the fifo for writing
+PY
+  HOLDER_PID=$!
+  # Wait for the holder to actually own the lock.
+  for _ in 1 2 3 4 5 6 7 8 9 10; do [ -f "$ready" ] && break; sleep 0.3; done
 
   "$BIN" run >/dev/null 2>&1 || true
-  if [ ! -f "$TMP/loop-ran" ] && [ -d "$CLAUDECRON_HOME/lock" ]; then
-    t_ok 'old lock with a live holder is not stolen'
+  if [ ! -f "$TMP/loop-ran" ]; then
+    t_ok 'a pass does not run while another runner holds the lock'
   else
-    t_fail 'old lock with a live holder is not stolen'
+    t_fail 'a pass does not run while another runner holds the lock'
   fi
 
-  kill "$LIVE_PID" 2>/dev/null || true
-  wait "$LIVE_PID" 2>/dev/null || true
+  # Release the holder, then a fresh pass must run.
+  echo go > "$releasefifo"
+  wait "$HOLDER_PID" 2>/dev/null || true
 
   "$BIN" run >/dev/null 2>&1 || true
   if [ -f "$TMP/loop-ran" ]; then
-    t_ok 'lock with a dead holder is reclaimed and the pass runs'
+    t_ok 'a pass runs once the lock is released'
   else
-    t_fail 'lock with a dead holder is reclaimed and the pass runs'
+    t_fail 'a pass runs once the lock is released'
   fi
   cleanup_home
 }
 
 # ---------------------------------------------------------------------------
-# 4. lock_release leaves the lock alone once another process owns it
+# 4. a crashed holder's advisory lock is not left dangling: flock is released
+#    by the kernel when the holding process dies, so the next pass proceeds.
 # ---------------------------------------------------------------------------
-test_release_only_if_owner() {
+test_lock_freed_on_holder_death() {
   fresh_home
-  bash -c '
-    set -u
-    . "'"$REPO"'/lib/common.sh"
-    . "'"$REPO"'/lib/config.sh"
-    . "'"$REPO"'/lib/due.sh"
-    . "'"$REPO"'/lib/lock.sh"
-    lock_acquire
-    # Simulate a thief taking over the lock while we were running.
-    printf "99999999\n" > "$CLAUDECRON_LOCK_DIR/pid"
-    lock_release
-  ' >/dev/null 2>&1 || true
+  export CLAUDECRON_TEST_BACKEND_CMD="touch '$TMP/loop-ran'"
+  "$BIN" add lk --interval 1 --cwd "$TMP" --tools Read --backend claude \
+    --prompt noop >/dev/null 2>&1
 
-  if [ -d "$CLAUDECRON_HOME/lock" ]; then
-    t_ok 'release does not remove a lock owned by someone else'
+  lockfile="$CLAUDECRON_HOME/lock/runner.lock"
+  mkdir -p "$CLAUDECRON_HOME/lock"
+  ready="$TMP/held2.ready"
+  # Helper takes the lock, signals ready, then exits (dies) - the kernel frees
+  # the flock. No fifo: the process just returns.
+  python3 - "$lockfile" "$ready" <<'PY'
+import fcntl, sys
+fh = open(sys.argv[1], "a+")
+fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+open(sys.argv[2], "w").close()
+# fall off the end -> process exits -> lock released by the kernel
+PY
+
+  "$BIN" run >/dev/null 2>&1 || true
+  if [ -f "$TMP/loop-ran" ]; then
+    t_ok 'a dead holder does not leave a dangling lock'
   else
-    t_fail 'release does not remove a lock owned by someone else'
+    t_fail 'a dead holder does not leave a dangling lock'
   fi
   cleanup_home
 }
@@ -174,9 +237,8 @@ test_failure_hook_fires() {
   export CLAUDECRON_TEST_BACKEND_CMD="exit 7"
   "$BIN" add failer --interval 1 --cwd "$TMP" --tools Read --backend claude \
     --prompt noop >/dev/null 2>&1
-  jq --arg c 'printf "%s %s %s\n" "$CLAUDECRON_LOOP_ID" "$CLAUDECRON_RESULT" "$CLAUDECRON_RC" >> "$CLAUDECRON_NOTIFY_TEST_FILE"' \
-    '.on_failure_cmd = $c' "$CLAUDECRON_HOME/config.json" > "$CLAUDECRON_HOME/config.json.new"
-  mv "$CLAUDECRON_HOME/config.json.new" "$CLAUDECRON_HOME/config.json"
+  jset_str "$CLAUDECRON_HOME/config.json" on_failure_cmd \
+    'printf "%s %s %s\n" "$CLAUDECRON_LOOP_ID" "$CLAUDECRON_RESULT" "$CLAUDECRON_RC" >> "$CLAUDECRON_NOTIFY_TEST_FILE"'
   export CLAUDECRON_NOTIFY_TEST_FILE="$TMP/notify.log"
 
   "$BIN" run >/dev/null 2>&1 || true
@@ -200,9 +262,12 @@ test_missed_windows_coalesce() {
     --prompt noop >/dev/null 2>&1
   # Pretend the loop last ran an hour ago: 60 missed 1-minute windows.
   mkdir -p "$CLAUDECRON_HOME/state/$HOST"
-  jq -n --argjson lr "$(( $(date +%s) - 3600 ))" \
-    '{ last_run: $lr, last_status: "ok", last_duration_s: 1 }' \
-    > "$CLAUDECRON_HOME/state/$HOST/late.json"
+  python3 - "$CLAUDECRON_HOME/state/$HOST/late.json" <<'PY'
+import json, sys, time
+with open(sys.argv[1], "w") as f:
+    json.dump({"last_run": int(time.time()) - 3600,
+               "last_status": "ok", "last_duration_s": 1}, f)
+PY
 
   "$BIN" run >/dev/null 2>&1 || true
   "$BIN" run >/dev/null 2>&1 || true
@@ -230,7 +295,7 @@ test_run_timeout_kills_hung_backend() {
   "$BIN" run >/dev/null 2>&1 || true
   elapsed=$(( $(date +%s) - start ))
 
-  status="$(jq -r '.last_status // empty' "$CLAUDECRON_HOME/state/$HOST/hung.json" 2>/dev/null)"
+  status="$(jget "$CLAUDECRON_HOME/state/$HOST/hung.json" last_status)"
   if [ "$status" = "error" ] && [ "$elapsed" -lt 60 ]; then
     t_ok 'hung backend is killed at the timeout and recorded as error'
   else
@@ -243,7 +308,7 @@ test_run_timeout_kills_hung_backend() {
 test_disabled_loop_is_skipped
 test_stdin_reader_does_not_starve_pass
 test_live_lock_never_stolen
-test_release_only_if_owner
+test_lock_freed_on_holder_death
 test_failure_hook_fires
 test_missed_windows_coalesce
 test_run_timeout_kills_hung_backend

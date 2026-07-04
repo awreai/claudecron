@@ -38,8 +38,8 @@ export CLAUDECRON_TEST_BACKEND_CMD='echo claudecron-smoke-ran'
 # 4. assert runner-owned state was written
 STATE="$CLAUDECRON_HOME/state/$HOST/smoke.json"
 test -f "$STATE" || { echo "FAIL: state file not written: $STATE" >&2; exit 1; }
-status="$(jq -r '.last_status' "$STATE")"
-last_run="$(jq -r '.last_run' "$STATE")"
+status="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("last_status",""))' "$STATE")"
+last_run="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("last_run",""))' "$STATE")"
 [ "$status" = "ok" ] || { echo "FAIL: last_status=$status (want ok)" >&2; exit 1; }
 { [ -n "$last_run" ] && [ "$last_run" != "null" ]; } \
   || { echo "FAIL: last_run not set" >&2; exit 1; }

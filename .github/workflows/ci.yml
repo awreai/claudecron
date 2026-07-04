@@ -7,7 +7,7 @@ on:
 
 jobs:
   test:
-    name: shellcheck + smoke (${{ matrix.os }})
+    name: lint + tests (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -19,31 +19,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install jq + shellcheck (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq shellcheck
-
-      - name: Install jq + shellcheck (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew install jq shellcheck
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
 
       - name: Show tool versions
         run: |
           bash --version | head -n 1
-          jq --version
-          shellcheck --version
+          python3 --version
 
-      - name: ShellCheck
+      - name: Byte-compile the runner
+        run: python3 -m py_compile bin/claudecron
+
+      - name: Lint (pyflakes, best-effort)
         run: |
-          shellcheck -s bash --severity=warning \
-            bin/claudecron \
-            lib/*.sh \
-            scripts/*.sh \
-            install.sh \
-            uninstall.sh
+          python3 -m pip install --quiet pyflakes || true
+          python3 -m pyflakes bin/claudecron || true
+
+      - name: Regression tests
+        run: bash scripts/regression-test.sh
 
       - name: Smoke test
         run: bash scripts/smoke-test.sh

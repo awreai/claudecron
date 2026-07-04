@@ -13,13 +13,13 @@ class Claudecron < Formula
   license "MIT"
   version "0.1.0"
 
-  depends_on "jq"
-  depends_on "bash"
+  depends_on "python@3"
 
   def install
-    # Lay the program tree into libexec; keep bin/ lib/ templates/ together so
-    # the entrypoint can resolve its siblings at runtime.
-    libexec.install "bin", "lib", "templates"
+    # The runner is a single self-contained Python file under bin/. Ship the
+    # skills alongside it so `claudecron skills install` can wire the agents.
+    libexec.install "bin"
+    libexec.install "skills" if File.directory?("skills")
     (libexec/"VERSION").write("#{version}\n") unless (libexec/"VERSION").exist?
 
     chmod 0755, libexec/"bin/claudecron"

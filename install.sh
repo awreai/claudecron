@@ -62,32 +62,22 @@ install_hint() {
   esac
 }
 
-require_bash() {
-  bash_bin="$(command -v bash 2>/dev/null || true)"
-  if [ -z "$bash_bin" ]; then
-    err "bash is required but was not found on PATH."
-    install_hint bash >&2
+require_python3() {
+  py_bin="$(command -v python3 2>/dev/null || true)"
+  if [ -z "$py_bin" ]; then
+    err "python3 is required but was not found on PATH."
+    install_hint python3 >&2
     exit 1
   fi
-  # Need bash >= 3.2. Read major.minor from BASH_VERSINFO.
-  major="$("$bash_bin" -c 'echo ${BASH_VERSINFO[0]:-0}' 2>/dev/null || echo 0)"
-  minor="$("$bash_bin" -c 'echo ${BASH_VERSINFO[1]:-0}' 2>/dev/null || echo 0)"
+  # Need Python >= 3.6 (f-strings not used, but pathlib/subprocess timeout are).
+  ver="$("$py_bin" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo 0.0)"
+  major="${ver%%.*}"; minor="${ver#*.}"
   case "$major" in *[!0-9]*|'') major=0 ;; esac
   case "$minor" in *[!0-9]*|'') minor=0 ;; esac
-  if [ "$major" -lt 3 ] || { [ "$major" -eq 3 ] && [ "$minor" -lt 2 ]; }; then
-    die "bash >= 3.2 required, found ${major}.${minor} at ${bash_bin}"
+  if [ "$major" -lt 3 ] || { [ "$major" -eq 3 ] && [ "$minor" -lt 6 ]; }; then
+    die "python3 >= 3.6 required, found ${ver} at ${py_bin}"
   fi
-  info "Found bash ${major}.${minor} at ${bash_bin}"
-}
-
-require_jq() {
-  if ! command -v jq >/dev/null 2>&1; then
-    err "jq is required but was not found on PATH."
-    info "Install it, then re-run this installer:" >&2
-    install_hint jq >&2
-    exit 1
-  fi
-  info "Found jq at $(command -v jq)"
+  info "Found python ${ver} at ${py_bin}"
 }
 
 # --- download + verify helpers ------------------------------------------------
@@ -137,18 +127,15 @@ verify_checksum() {
 
 stage_tree() {
   # stage_tree SRC_DIR
-  # SRC_DIR must contain bin/ lib/ templates/ and (ideally) VERSION.
+  # SRC_DIR must contain bin/ and (ideally) VERSION. The runner is a single
+  # self-contained Python file under bin/; there is no lib/ or templates/.
   _src="$1"
   [ -d "$_src/bin" ] || die "staging source missing bin/ at ${_src}"
-  [ -d "$_src/lib" ] || die "staging source missing lib/ at ${_src}"
-  [ -d "$_src/templates" ] || die "staging source missing templates/ at ${_src}"
 
   # Idempotent: clear then copy.
   rm -rf "$LIBEXEC"
   mkdir -p "$LIBEXEC"
   cp -R "$_src/bin" "$LIBEXEC/bin"
-  cp -R "$_src/lib" "$LIBEXEC/lib"
-  cp -R "$_src/templates" "$LIBEXEC/templates"
   # Ship the agent skills so 'claudecron skills install' can wire Claude Code
   # and Codex. Optional: absence is non-fatal (the CLI works standalone).
   [ -d "$_src/skills" ] && cp -R "$_src/skills" "$LIBEXEC/skills"
@@ -236,14 +223,13 @@ scaffold_config() {
 main() {
   info "claudecron installer (version ${VER})"
 
-  require_bash
-  require_jq
+  require_python3
 
   # SAFE local-dir fallback: if run from a checkout that already has a built
   # tree (./bin/claudecron), stage from there instead of downloading. Lets the
   # installer be exercised offline / in tests with no network and no real release.
   _self_dir="$(unset CDPATH; cd -- "$(dirname -- "$0")" && pwd)"
-  if [ -x "$_self_dir/bin/claudecron" ] && [ -d "$_self_dir/lib" ] && [ -d "$_self_dir/templates" ]; then
+  if [ -x "$_self_dir/bin/claudecron" ]; then
     info "Local checkout detected at ${_self_dir}; staging from there (offline mode)"
     stage_tree "$_self_dir"
   else
