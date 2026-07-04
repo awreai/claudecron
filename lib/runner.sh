@@ -54,6 +54,106 @@ runner__harden_path() {
   export PATH
 }
 
+# runner__notify_failure <id> <backend> <rc> <dur> <loop_log>
+#   Fire the configured on_failure_cmd hook (if any) so a failed run can page a
+#   human. The hook is run detached from the runner's own stdin/stdout and is
+#   never allowed to fail the pass: its own errors are swallowed. The loop's
+#   context is exported so the command can build a message without parsing args:
+#     CLAUDECRON_LOOP_ID, CLAUDECRON_BACKEND, CLAUDECRON_RESULT (always "error"
+#     here), CLAUDECRON_RC, CLAUDECRON_DURATION_S, CLAUDECRON_LOOP_LOG,
+#     CLAUDECRON_HOST. A short tail of the loop log is exported as
+#     CLAUDECRON_LOG_TAIL for a one-glance failure summary.
+runner__notify_failure() {
+  nf__id="$1"; nf__backend="$2"; nf__rc="$3"; nf__dur="$4"; nf__loglog="$5"
+
+  nf__cmd="$(cfg_get on_failure_cmd "")"
+  if [ -z "$nf__cmd" ]; then
+    unset nf__id nf__backend nf__rc nf__dur nf__loglog nf__cmd
+    return 0
+  fi
+
+  nf__tail=""
+  if [ -f "$nf__loglog" ]; then
+    nf__tail="$(tail -n 20 "$nf__loglog" 2>/dev/null || true)"
+  fi
+
+  runner__log "notify id=$nf__id firing on_failure_cmd"
+  (
+    CLAUDECRON_LOOP_ID="$nf__id" \
+    CLAUDECRON_BACKEND="$nf__backend" \
+    CLAUDECRON_RESULT="error" \
+    CLAUDECRON_RC="$nf__rc" \
+    CLAUDECRON_DURATION_S="$nf__dur" \
+    CLAUDECRON_LOOP_LOG="$nf__loglog" \
+    CLAUDECRON_HOST="$CLAUDECRON_HOST" \
+    CLAUDECRON_LOG_TAIL="$nf__tail" \
+    export CLAUDECRON_LOOP_ID CLAUDECRON_BACKEND CLAUDECRON_RESULT \
+           CLAUDECRON_RC CLAUDECRON_DURATION_S CLAUDECRON_LOOP_LOG \
+           CLAUDECRON_HOST CLAUDECRON_LOG_TAIL
+    sh -c "$nf__cmd" </dev/null >>"$CLAUDECRON_RUNNER_LOG" 2>&1
+  ) || runner__log "notify id=$nf__id on_failure_cmd exited non-zero (ignored)"
+
+  unset nf__id nf__backend nf__rc nf__dur nf__loglog nf__cmd nf__tail
+  return 0
+}
+
+# runner__run_with_timeout <timeout_s> <command...>
+#   Run the command; if it does not finish within <timeout_s> seconds, kill it
+#   (TERM then KILL) and return 124. A timeout of 0/empty means no limit and the
+#   command runs directly. bash 3.2 safe: no `timeout(1)` dependency, uses a
+#   background watchdog. The command's own exit status is returned when it wins.
+runner__run_with_timeout() {
+  rwt__timeout="$1"; shift
+  case "$rwt__timeout" in
+    ''|*[!0-9]* ) rwt__timeout=0 ;;
+  esac
+
+  if [ "$rwt__timeout" -le 0 ]; then
+    # Guard so a non-zero backend does not trip the caller's set -e before the
+    # status is captured and returned.
+    rwt__rc=0
+    "$@" || rwt__rc=$?
+    return "$rwt__rc"
+  fi
+
+  # Run the command in the background, watch it with a killer subshell.
+  "$@" &
+  rwt__cmd_pid=$!
+
+  (
+    rwt__waited=0
+    while [ "$rwt__waited" -lt "$rwt__timeout" ]; do
+      kill -0 "$rwt__cmd_pid" 2>/dev/null || exit 0
+      sleep 1
+      rwt__waited=$(( rwt__waited + 1 ))
+    done
+    # Still alive at the deadline: terminate the process group of the command.
+    kill -TERM "$rwt__cmd_pid" 2>/dev/null || true
+    sleep 2
+    kill -KILL "$rwt__cmd_pid" 2>/dev/null || true
+  ) &
+  rwt__killer_pid=$!
+
+  # Capture the command's (possibly signal-based) status. The `|| rwt__rc=$?`
+  # both records the real code AND keeps set -e from aborting the function on a
+  # non-zero/killed result before we can normalize it below.
+  rwt__rc=0
+  wait "$rwt__cmd_pid" 2>/dev/null || rwt__rc=$?
+
+  # Command finished (or was killed). Stop the watchdog.
+  kill "$rwt__killer_pid" 2>/dev/null || true
+  wait "$rwt__killer_pid" 2>/dev/null || true
+
+  # A killed command reports 143 (TERM) or 137 (KILL); normalize to 124 so the
+  # caller can log a clear "timed out" without guessing at signal numbers.
+  case "$rwt__rc" in
+    143|137 ) rwt__rc=124 ;;
+  esac
+
+  unset rwt__timeout rwt__cmd_pid rwt__killer_pid rwt__waited
+  return "$rwt__rc"
+}
+
 # runner__resolve_prompt <prompt_file_rel_or_abs> - print absolute prompt path.
 runner__resolve_prompt() {
   rp__pf="$1"
@@ -105,7 +205,10 @@ runner__run_one() {
   ro__log_keep="$4"
 
   ro__id="$(printf '%s' "$ro__json" | cc_jq -r '.id')"
-  ro__enabled="$(printf '%s' "$ro__json" | cc_jq -r '.enabled // true')"
+  # NB: use an explicit null check, not `.enabled // true`. jq's `//` treats
+  # the boolean `false` as empty and would fall through to the default, so a
+  # disabled loop (enabled:false) would read back as "true" and run anyway.
+  ro__enabled="$(printf '%s' "$ro__json" | cc_jq -r 'if .enabled == null then "true" else (.enabled | tostring) end')"
   ro__interval="$(printf '%s' "$ro__json" | cc_jq -r '.interval_minutes // 15')"
   ro__cwd="$(printf '%s' "$ro__json" | cc_jq -r '.cwd // "."')"
   ro__tools="$(printf '%s' "$ro__json" | cc_jq -r '.allowed_tools // "Bash,Read"')"
@@ -178,18 +281,38 @@ runner__run_one() {
 
   # Expand add_dirs into positionals without arrays: set -- inside a subshell
   # by reading the newline list. We pass them after the fixed four args.
+  # Per-run timeout: env override wins, else config run_timeout_s, else 0 (off).
+  # A hung backend must never hold the lock forever and starve every later wake.
+  ro__timeout="${CLAUDECRON_RUN_TIMEOUT_S:-}"
+  [ -n "$ro__timeout" ] || ro__timeout="$(cfg_get run_timeout_s 0)"
+  case "$ro__timeout" in ''|*[!0-9]* ) ro__timeout=0 ;; esac
+
+  # Disable errexit around backend execution. The backend (and the test seam)
+  # legitimately exits non-zero, and errexit inside a called function would
+  # abort the whole runner before we record the failure - a bug that swallowed
+  # the status line and skipped state recording. We capture the code by hand.
   ro__rc=0
+  set +e
   if [ -n "$ro__adddirs" ]; then
     # Convert newline list to positional args using a here-doc fed loop into
     # a saved param string is unsafe with spaces; instead use a function that
     # reads them via 'set --' from a subshell-safe construct.
-    runner__exec_with_adddirs "$ro__backend" "$ro__prompt" "$ro__tools" "$ro__cwd" "$ro__adddirs" \
+    runner__run_with_timeout "$ro__timeout" \
+      runner__exec_with_adddirs "$ro__backend" "$ro__prompt" "$ro__tools" "$ro__cwd" "$ro__adddirs" \
       >> "$ro__loop_log" 2>&1
     ro__rc=$?
   else
-    cc_backend_exec "$ro__backend" "$ro__prompt" "$ro__tools" "$ro__cwd" \
+    runner__run_with_timeout "$ro__timeout" \
+      cc_backend_exec "$ro__backend" "$ro__prompt" "$ro__tools" "$ro__cwd" \
       >> "$ro__loop_log" 2>&1
     ro__rc=$?
+  fi
+  set -e
+
+  if [ "$ro__rc" -eq 124 ]; then
+    printf '%s ----- run TIMED OUT id=%s after %ss -----\n' "$(cc_now_iso)" "$ro__id" "$ro__timeout" \
+      >> "$ro__loop_log" 2>/dev/null || true
+    runner__log "timeout id=$ro__id after=${ro__timeout}s"
   fi
 
   ro__end="$(epoch_now)"
@@ -209,6 +332,7 @@ runner__run_one() {
   else
     state_record_run "$ro__id" error "$ro__dur"
     runner__log "status id=$ro__id result=error rc=$ro__rc dur=${ro__dur}s"
+    runner__notify_failure "$ro__id" "$ro__backend" "$ro__rc" "$ro__dur" "$ro__loop_log"
   fi
 
   unset ro__json ro__force ro__dry ro__log_keep ro__id ro__enabled ro__interval ro__cwd ro__tools ro__prompt_file ro__backend ro__adddirs ro__prompt_path ro__loop_log ro__last ro__is_due ro__prompt ro__start ro__end ro__dur ro__rc
@@ -277,10 +401,19 @@ cc_run() {
     runner__log "wake source=cli host=$CLAUDECRON_HOST"
   fi
 
-  # Iterate loops with portable while-read. Each loop entry is emitted as a
-  # single compact JSON line by jq -c; we read line by line (no mapfile).
+  # Iterate the registry over a DEDICATED file descriptor (FD 3), never FD 0.
+  #
+  # If we drove this `while read` from stdin, the loop body runs a backend
+  # (e.g. `claude -p`) that inherits and drains the runner's stdin - the first
+  # loop's backend would swallow the rest of the registry stream and every
+  # later loop would silently starve. Reading entries from FD 3 keeps the
+  # iteration cursor completely out of reach of whatever a backend does with
+  # FD 0. The backend additionally gets its own </dev/null stdin in
+  # cc_backend_exec, so this is safe belt-and-suspenders. Entries are snapshot
+  # up front (one compact JSON line each) so a backend can never re-read or
+  # race the registry file mid-pass.
   cr__count=0
-  while IFS= read -r cr__entry; do
+  while IFS= read -r cr__entry <&3; do
     [ -n "$cr__entry" ] || continue
     if [ -n "$cr__only_id" ]; then
       cr__this_id="$(printf '%s' "$cr__entry" | cc_jq -r '.id')"
@@ -288,7 +421,7 @@ cc_run() {
     fi
     cr__count=$(( cr__count + 1 ))
     runner__run_one "$cr__entry" "$cr__force" "$cr__dry" "$cr__log_keep"
-  done <<EOF
+  done 3<<EOF
 $(registry_read | cc_jq -c '.loops[]')
 EOF
 

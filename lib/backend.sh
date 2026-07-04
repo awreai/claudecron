@@ -135,12 +135,15 @@ cc_backend_exec() {
       unset cbe__ndirs cbe__i cbe__d
       # Now "$@" = (--add-dir D1 --add-dir D2 ...). Prepend the fixed claude
       # flags and run, with cwd as the primary --add-dir.
+      # stdin from /dev/null: the runner iterates its registry over a separate
+      # FD, but a backend must never be able to read the runner's stdin (it
+      # would drain the iteration stream and starve later loops).
       ( cd "$cbe__cwd" 2>/dev/null || { cc_err "cwd missing: $cbe__cwd"; exit 3; }
         exec "$cbe__bin" -p "$cbe__prompt" \
           --allowedTools "$cbe__tools" \
           --add-dir "$cbe__cwd" \
           ${@+"$@"} \
-          --output-format text
+          --output-format text </dev/null
       )
       return $?
       ;;
@@ -149,7 +152,7 @@ cc_backend_exec() {
         exec "$cbe__bin" exec "$cbe__prompt" \
           --cd "$cbe__cwd" \
           --sandbox workspace-write \
-          --ask-for-approval never
+          --ask-for-approval never </dev/null
       )
       return $?
       ;;

@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+# regression-test.sh - token-free regression tests for the runner core.
+# Each test stands up an isolated CLAUDECRON_HOME in a temp dir and drives the
+# real CLI. No claude/codex call, zero tokens, no network.
+#
+#   1. disabled loops are skipped by a wake pass
+#   2. a stdin-reading backend cannot starve later loops in the same pass
+#   3. a lock held by a LIVE runner is never stolen; a dead holder's is
+#   4. lock_release leaves a lock alone once another process owns it
+#   5. a failing loop fires the on_failure_cmd hook
+#   6. a loop that missed many windows catches up with ONE run, not N
+#   7. a backend that exceeds the run timeout is killed and recorded as error
+#
+# No `set -e`: each test records pass/fail explicitly and many steps are
+# expected to return non-zero (skipped runs, absent files); an early exit
+# would abort the whole suite on the first such step.
+set -uo pipefail
+
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+BIN="$REPO/bin/claudecron"
+HOST="$(hostname -s)"
+PASS=0
+FAIL=0
+
+t_ok()   { printf 'ok - %s\n' "$1"; PASS=$((PASS + 1)); }
+t_fail() { printf 'not ok - %s\n' "$1"; FAIL=$((FAIL + 1)); }
+
+# fresh_home - new isolated data home; sets TMP and CLAUDECRON_HOME.
+fresh_home() {
+  TMP="$(mktemp -d "${TMPDIR:-/tmp}/claudecron-reg.XXXXXX")"
+  export HOME="$TMP/home"
+  export XDG_CONFIG_HOME="$HOME/.config"
+  export CLAUDECRON_HOME="$XDG_CONFIG_HOME/claudecron"
+  mkdir -p "$HOME"
+  "$BIN" init --no-scheduler --no-skills >/dev/null 2>&1
+}
+
+cleanup_home() {
+  rm -rf "$TMP"
+  unset CLAUDECRON_TEST_BACKEND_CMD 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# 1. disabled loops are skipped by a wake pass
+# ---------------------------------------------------------------------------
+test_disabled_loop_is_skipped() {
+  fresh_home
+  export CLAUDECRON_TEST_BACKEND_CMD="touch '$TMP/dis-ran'"
+  "$BIN" add dis --interval 1 --cwd "$TMP" --tools Read --backend claude \
+    --prompt noop --disabled >/dev/null 2>&1
+  "$BIN" run >/dev/null 2>&1 || true
+
+  if [ ! -f "$TMP/dis-ran" ]; then
+    t_ok 'disabled loop does not run on a wake pass'
+  else
+    t_fail 'disabled loop does not run on a wake pass'
+  fi
+  if grep -q 'skip id=dis reason=disabled' "$CLAUDECRON_HOME/logs/runner.log" 2>/dev/null; then
+    t_ok 'disabled loop skip is logged'
+  else
+    t_fail 'disabled loop skip is logged'
+  fi
+  cleanup_home
+}
+
+# ---------------------------------------------------------------------------
+# 2. a stdin-reading backend cannot starve later loops in the same pass
+#    (uses a fake claude binary because the real bug is stdin inheritance,
+#    which the test seam does not exercise)
+# ---------------------------------------------------------------------------
+test_stdin_reader_does_not_starve_pass() {
+  fresh_home
+  cat > "$TMP/fake-claude" <<'EOS'
+#!/bin/sh
+# Behave like claude -p: read and discard all of stdin, then emit output.
+cat > /dev/null
+echo fake-claude-output
+EOS
+  chmod +x "$TMP/fake-claude"
+  jq --arg b "$TMP/fake-claude" '.claude_bin = $b' "$CLAUDECRON_HOME/config.json" \
+    > "$CLAUDECRON_HOME/config.json.new"
+  mv "$CLAUDECRON_HOME/config.json.new" "$CLAUDECRON_HOME/config.json"
+
+  for id in aaa bbb ccc; do
+    "$BIN" add "$id" --interval 1 --cwd "$TMP" --tools Read --backend claude \
+      --prompt noop >/dev/null 2>&1
+  done
+  "$BIN" run >/dev/null 2>&1 || true
+
+  local all_ok=1
+  for id in aaa bbb ccc; do
+    status="$(jq -r '.last_status // empty' "$CLAUDECRON_HOME/state/$HOST/$id.json" 2>/dev/null)"
+    [ "$status" = "ok" ] || all_ok=0
+  done
+  if [ "$all_ok" = "1" ]; then
+    t_ok 'all three loops ran despite a stdin-eating backend'
+  else
+    t_fail 'all three loops ran despite a stdin-eating backend'
+  fi
+  if grep -q 'wake done.*processed=3' "$CLAUDECRON_HOME/logs/runner.log" 2>/dev/null; then
+    t_ok 'pass processed the whole registry'
+  else
+    t_fail 'pass processed the whole registry'
+  fi
+  cleanup_home
+}
+
+# ---------------------------------------------------------------------------
+# 3. a lock held by a LIVE process is never stolen, however old; a lock whose
+#    recorded holder is dead is reclaimed
+# ---------------------------------------------------------------------------
+test_live_lock_never_stolen() {
+  fresh_home
+  export CLAUDECRON_TEST_BACKEND_CMD="touch '$TMP/loop-ran'"
+  "$BIN" add lk --interval 1 --cwd "$TMP" --tools Read --backend claude \
+    --prompt noop >/dev/null 2>&1
+
+  sleep 600 &
+  LIVE_PID=$!
+  mkdir -p "$CLAUDECRON_HOME/lock"
+  printf '%s\n' "$LIVE_PID" > "$CLAUDECRON_HOME/lock/pid"
+  # Backdate way past any staleness threshold.
+  touch -t 202601010000 "$CLAUDECRON_HOME/lock"
+
+  "$BIN" run >/dev/null 2>&1 || true
+  if [ ! -f "$TMP/loop-ran" ] && [ -d "$CLAUDECRON_HOME/lock" ]; then
+    t_ok 'old lock with a live holder is not stolen'
+  else
+    t_fail 'old lock with a live holder is not stolen'
+  fi
+
+  kill "$LIVE_PID" 2>/dev/null || true
+  wait "$LIVE_PID" 2>/dev/null || true
+
+  "$BIN" run >/dev/null 2>&1 || true
+  if [ -f "$TMP/loop-ran" ]; then
+    t_ok 'lock with a dead holder is reclaimed and the pass runs'
+  else
+    t_fail 'lock with a dead holder is reclaimed and the pass runs'
+  fi
+  cleanup_home
+}
+
+# ---------------------------------------------------------------------------
+# 4. lock_release leaves the lock alone once another process owns it
+# ---------------------------------------------------------------------------
+test_release_only_if_owner() {
+  fresh_home
+  bash -c '
+    set -u
+    . "'"$REPO"'/lib/common.sh"
+    . "'"$REPO"'/lib/config.sh"
+    . "'"$REPO"'/lib/due.sh"
+    . "'"$REPO"'/lib/lock.sh"
+    lock_acquire
+    # Simulate a thief taking over the lock while we were running.
+    printf "99999999\n" > "$CLAUDECRON_LOCK_DIR/pid"
+    lock_release
+  ' >/dev/null 2>&1 || true
+
+  if [ -d "$CLAUDECRON_HOME/lock" ]; then
+    t_ok 'release does not remove a lock owned by someone else'
+  else
+    t_fail 'release does not remove a lock owned by someone else'
+  fi
+  cleanup_home
+}
+
+# ---------------------------------------------------------------------------
+# 5. a failing loop fires the on_failure_cmd hook
+# ---------------------------------------------------------------------------
+test_failure_hook_fires() {
+  fresh_home
+  export CLAUDECRON_TEST_BACKEND_CMD="exit 7"
+  "$BIN" add failer --interval 1 --cwd "$TMP" --tools Read --backend claude \
+    --prompt noop >/dev/null 2>&1
+  jq --arg c 'printf "%s %s %s\n" "$CLAUDECRON_LOOP_ID" "$CLAUDECRON_RESULT" "$CLAUDECRON_RC" >> "$CLAUDECRON_NOTIFY_TEST_FILE"' \
+    '.on_failure_cmd = $c' "$CLAUDECRON_HOME/config.json" > "$CLAUDECRON_HOME/config.json.new"
+  mv "$CLAUDECRON_HOME/config.json.new" "$CLAUDECRON_HOME/config.json"
+  export CLAUDECRON_NOTIFY_TEST_FILE="$TMP/notify.log"
+
+  "$BIN" run >/dev/null 2>&1 || true
+
+  if grep -q '^failer error 7$' "$TMP/notify.log" 2>/dev/null; then
+    t_ok 'on_failure_cmd fires with loop id, result, and rc'
+  else
+    t_fail 'on_failure_cmd fires with loop id, result, and rc'
+  fi
+  unset CLAUDECRON_NOTIFY_TEST_FILE
+  cleanup_home
+}
+
+# ---------------------------------------------------------------------------
+# 6. a loop that missed many windows catches up with ONE run, not N
+# ---------------------------------------------------------------------------
+test_missed_windows_coalesce() {
+  fresh_home
+  export CLAUDECRON_TEST_BACKEND_CMD="echo ran >> '$TMP/runs.log'"
+  "$BIN" add late --interval 1 --cwd "$TMP" --tools Read --backend claude \
+    --prompt noop >/dev/null 2>&1
+  # Pretend the loop last ran an hour ago: 60 missed 1-minute windows.
+  mkdir -p "$CLAUDECRON_HOME/state/$HOST"
+  jq -n --argjson lr "$(( $(date +%s) - 3600 ))" \
+    '{ last_run: $lr, last_status: "ok", last_duration_s: 1 }' \
+    > "$CLAUDECRON_HOME/state/$HOST/late.json"
+
+  "$BIN" run >/dev/null 2>&1 || true
+  "$BIN" run >/dev/null 2>&1 || true
+
+  runs="$(wc -l < "$TMP/runs.log" 2>/dev/null | tr -d ' ')"
+  if [ "$runs" = "1" ]; then
+    t_ok 'sixty missed windows coalesce into exactly one catch-up run'
+  else
+    t_fail "sixty missed windows coalesce into exactly one catch-up run (got ${runs:-0})"
+  fi
+  cleanup_home
+}
+
+# ---------------------------------------------------------------------------
+# 7. a backend that exceeds the run timeout is killed and recorded as error
+# ---------------------------------------------------------------------------
+test_run_timeout_kills_hung_backend() {
+  fresh_home
+  export CLAUDECRON_TEST_BACKEND_CMD="sleep 300"
+  export CLAUDECRON_RUN_TIMEOUT_S=3
+  "$BIN" add hung --interval 1 --cwd "$TMP" --tools Read --backend claude \
+    --prompt noop >/dev/null 2>&1
+
+  start="$(date +%s)"
+  "$BIN" run >/dev/null 2>&1 || true
+  elapsed=$(( $(date +%s) - start ))
+
+  status="$(jq -r '.last_status // empty' "$CLAUDECRON_HOME/state/$HOST/hung.json" 2>/dev/null)"
+  if [ "$status" = "error" ] && [ "$elapsed" -lt 60 ]; then
+    t_ok 'hung backend is killed at the timeout and recorded as error'
+  else
+    t_fail "hung backend is killed at the timeout and recorded as error (status=${status:-none} elapsed=${elapsed}s)"
+  fi
+  unset CLAUDECRON_RUN_TIMEOUT_S
+  cleanup_home
+}
+
+test_disabled_loop_is_skipped
+test_stdin_reader_does_not_starve_pass
+test_live_lock_never_stolen
+test_release_only_if_owner
+test_failure_hook_fires
+test_missed_windows_coalesce
+test_run_timeout_kills_hung_backend
+
+printf '%s passed, %s failed\n' "$PASS" "$FAIL"
+[ "$FAIL" -eq 0 ]

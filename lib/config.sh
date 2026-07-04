@@ -63,9 +63,14 @@ config_ensure() {
 }
 
 # config_read - emit config.json merged over defaults (fills missing keys).
+# The file wins over defaults. NB: slurp BOTH inputs and merge as .[0] * .[1];
+# an earlier form used `.[0] * (input // {})`, but under -s every input is
+# already slurped into the array so `input` raises a break error, the whole
+# expression fails, and (with stderr hidden) config_read silently fell back to
+# pure defaults - dropping claude_bin/codex_bin pins and every other override.
 config_read() {
   if [ -f "$CLAUDECRON_CONFIG" ]; then
-    config_default_json | cc_jq -s '.[0] * (input // {})' - "$CLAUDECRON_CONFIG" 2>/dev/null \
+    config_default_json | cc_jq -s '.[0] * .[1]' - "$CLAUDECRON_CONFIG" 2>/dev/null \
       || config_default_json
   else
     config_default_json
