@@ -355,14 +355,19 @@ test_notify_helper_systemic_coalesce() {
   [ -x "$NOTIFY" ] || { t_fail 'claudecron-notify helper is present'; cleanup_home; return; }
   mkdir -p "$CLAUDECRON_HOME/logs"
 
-  # Three different loops all hit an agent quota limit.
+  # Three different loops all hit an agent quota limit. Use a REALISTIC tail:
+  # the runner passes the last lines of the loop log, whose final line is the
+  # timestamped "----- run end -----" banner. The reason extraction must skip
+  # that banner to see the real cause underneath (regression guard).
   for lp in loop-a loop-b loop-c; do
+    tail=$'2026-07-05T10:00:00+0530 ----- run start id='"$lp"$' backend=claude -----\nYou have reached your Fable 5 limit. Run /usage-credits.\n2026-07-05T10:00:05+0530 ----- run end id='"$lp"$' rc=1 dur=5s -----'
     CLAUDECRON_LOOP_ID=$lp CLAUDECRON_RC=1 CLAUDECRON_HOST="$HOST" \
-      CLAUDECRON_LOG_TAIL="You have reached your Fable 5 limit. Run /usage-credits." python3 "$NOTIFY"
+      CLAUDECRON_LOG_TAIL="$tail" python3 "$NOTIFY"
   done
-  # A genuine per-loop bug.
+  # A genuine per-loop bug, also wrapped in realistic banners.
+  dtail=$'2026-07-05T10:00:00+0530 ----- run start id=loop-d backend=claude -----\nTypeError: object is not subscriptable\n2026-07-05T10:00:02+0530 ----- run end id=loop-d rc=2 dur=2s -----'
   CLAUDECRON_LOOP_ID=loop-d CLAUDECRON_RC=2 CLAUDECRON_HOST="$HOST" \
-    CLAUDECRON_LOG_TAIL="TypeError: object is not subscriptable" python3 "$NOTIFY"
+    CLAUDECRON_LOG_TAIL="$dtail" python3 "$NOTIFY"
 
   keys="$(python3 -c 'import json,sys; print(",".join(sorted(json.load(open(sys.argv[1])).keys())))' \
     "$CLAUDECRON_HOME/.notify-dedup.json" 2>/dev/null)"

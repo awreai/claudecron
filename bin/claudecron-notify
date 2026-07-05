@@ -50,9 +50,26 @@ def now():
     return datetime.datetime.now().astimezone()
 
 
+QUEUE_MAX_LINES = 500  # cap the audit queue so a long outage cannot grow it unbounded
+
+
 def append_queue(qpath, record):
     with open(qpath, "a") as fh:
         fh.write(json.dumps(record) + "\n")
+    # Bound the queue: during a sustained outage this file gets one line per
+    # loop per wake. Keep only the most recent QUEUE_MAX_LINES so it cannot grow
+    # without limit before a notifier drains it. Cheap check (only rewrites when
+    # over the cap), best-effort.
+    try:
+        with open(qpath) as fh:
+            lines = fh.readlines()
+        if len(lines) > QUEUE_MAX_LINES:
+            tmp = qpath + ".tmp"
+            with open(tmp, "w") as fh:
+                fh.writelines(lines[-QUEUE_MAX_LINES:])
+            os.replace(tmp, qpath)
+    except OSError:
+        pass
 
 
 def load_dedup(path):
@@ -127,10 +144,14 @@ def main():
         pass
 
     # A short, human reason from the tail (last non-empty, non-banner line).
+    # The tail includes claudecron's own run banners, whose last line is
+    # "<iso-ts> ----- run end id=... -----" - it has a LEADING TIMESTAMP, so a
+    # bare startswith("-----") check misses it. Skip any line containing the
+    # "----- run" banner marker (start / end / TIMED OUT) wherever it appears.
     reason = ""
     for line in reversed(tail.splitlines()):
         line = line.strip()
-        if line and not line.startswith("-----"):
+        if line and "----- run" not in line:
             reason = line
             break
 
