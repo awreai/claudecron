@@ -385,6 +385,40 @@ test_notify_helper_systemic_coalesce() {
   cleanup_home
 }
 
+# ---------------------------------------------------------------------------
+# 10. per-loop model resolution: a loop with no model follows config
+#     default_model; --model X pins X; --model "" omits --model entirely
+#     (CLI default). Asserted via the dry-run command preview.
+# ---------------------------------------------------------------------------
+test_per_loop_model_resolution() {
+  fresh_home
+  "$BIN" add m-default --interval 1 --cwd "$TMP" --tools Read --prompt noop >/dev/null 2>&1
+  "$BIN" add m-fable   --interval 1 --cwd "$TMP" --tools Read --model fable --prompt noop >/dev/null 2>&1
+  "$BIN" add m-none    --interval 1 --cwd "$TMP" --tools Read --model "" --prompt noop >/dev/null 2>&1
+  out="$("$BIN" run --dry-run 2>&1)"
+
+  # Default loop -> config default_model (opus) present.
+  if printf '%s' "$out" | grep -A1 "loop=m-default" | grep -q -- "--model 'opus'"; then
+    t_ok 'loop with no model uses the opus default'
+  else
+    t_fail 'loop with no model uses the opus default'
+  fi
+  # Explicit override -> fable.
+  if printf '%s' "$out" | grep -A1 "loop=m-fable" | grep -q -- "--model 'fable'"; then
+    t_ok 'per-loop --model overrides the default'
+  else
+    t_fail 'per-loop --model overrides the default'
+  fi
+  # Empty string -> no --model at all on that loop's command line.
+  none_cmd="$(printf '%s' "$out" | grep -A1 "loop=m-none" | grep 'command:')"
+  if [ -n "$none_cmd" ] && ! printf '%s' "$none_cmd" | grep -q -- "--model"; then
+    t_ok 'empty --model omits the flag (CLI default)'
+  else
+    t_fail 'empty --model omits the flag (CLI default)'
+  fi
+  cleanup_home
+}
+
 test_disabled_loop_is_skipped
 test_stdin_reader_does_not_starve_pass
 test_live_lock_never_stolen
@@ -394,6 +428,7 @@ test_missed_windows_coalesce
 test_run_timeout_kills_hung_backend
 test_notify_helper_enqueues_and_coalesces
 test_notify_helper_systemic_coalesce
+test_per_loop_model_resolution
 
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

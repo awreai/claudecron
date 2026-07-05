@@ -42,6 +42,10 @@ DEFAULT_ALLOWED_TOOLS = "Bash,Read"                  # library default
 ADD_DEFAULT_ALLOWED_TOOLS = "Bash,Read,Write,Edit"   # the `add` command's default
 DEFAULT_LOCK_STALE_MINUTES = 30
 DEFAULT_LOG_KEEP_LINES = 500
+# Model passed to the claude backend (--model). A loop's own `model` wins; then
+# config `default_model`; then this constant. Empty string means "omit --model
+# and let the claude CLI pick its own default". codex ignores the model.
+DEFAULT_MODEL = "opus"
 
 SCHED_LABEL = "dev.claudecron.runner"
 
@@ -430,30 +434,34 @@ class Backend:
             pass
         return None
 
-    def build_argv(self, bin_path, backend, prompt, tools, cwd, add_dirs):
+    def build_argv(self, bin_path, backend, prompt, tools, cwd, add_dirs, model=""):
         if backend == "claude":
             argv = [bin_path, "-p", prompt, "--allowedTools", tools, "--add-dir", cwd]
             for d in add_dirs:
                 if d:
                     argv += ["--add-dir", d]
+            if model:
+                argv += ["--model", model]
             argv += ["--output-format", "text"]
             return argv
         if backend == "codex":
+            # codex selects its model via its own config, not a per-call flag.
             return [bin_path, "exec", prompt, "--cd", cwd,
                     "--sandbox", "workspace-write", "--ask-for-approval", "never"]
         die("cannot build argv for unknown backend '%s'" % backend, code=2)
 
-    def preview(self, backend, bin_path, tools, cwd, add_dirs):
+    def preview(self, backend, bin_path, tools, cwd, add_dirs, model=""):
         if backend == "claude":
             extra = "".join(" --add-dir '%s'" % d for d in add_dirs if d)
-            return ("%s -p '<prompt>' --allowedTools '%s' --add-dir '%s'%s "
-                    "--output-format text" % (bin_path, tools, cwd, extra))
+            model_s = (" --model '%s'" % model) if model else ""
+            return ("%s -p '<prompt>' --allowedTools '%s' --add-dir '%s'%s%s "
+                    "--output-format text" % (bin_path, tools, cwd, extra, model_s))
         if backend == "codex":
             return ("%s exec '<prompt>' --cd '%s' --sandbox workspace-write "
                     "--ask-for-approval never" % (bin_path, cwd))
         return "(unknown backend %s)" % backend
 
-    def exec(self, backend, prompt, tools, cwd, add_dirs, log_fh, timeout_s):
+    def exec(self, backend, prompt, tools, cwd, add_dirs, log_fh, timeout_s, model=""):
         seam = os.environ.get("CLAUDECRON_TEST_BACKEND_CMD")
         if seam:
             return self._exec_seam(seam, backend, prompt, tools, cwd, log_fh, timeout_s)
@@ -462,7 +470,7 @@ class Backend:
             log_fh.write("backend '%s' binary not found on PATH\n" % backend)
             log_fh.flush()
             return 127
-        argv = self.build_argv(bin_path, backend, prompt, tools, cwd, add_dirs)
+        argv = self.build_argv(bin_path, backend, prompt, tools, cwd, add_dirs, model)
         return self._run(argv, cwd, log_fh, timeout_s, env=None)
 
     def _exec_seam(self, seam, backend, prompt, tools, cwd, log_fh, timeout_s):
@@ -583,6 +591,12 @@ class Runner:
         prompt_file = loop.get("prompt_file") or ("prompts/%s.md" % loop_id)
         backend = self.field(loop, "backend", DEFAULT_BACKEND)
         add_dirs = loop.get("add_dirs") or []
+        # Model resolution: the loop's own model wins; else the config default;
+        # else the built-in DEFAULT_MODEL. An explicit empty string anywhere
+        # means "omit --model and let the claude CLI choose".
+        model = loop.get("model")
+        if model is None:
+            model = self.config.get("default_model", DEFAULT_MODEL)
 
         prompt_path = (Path(prompt_file) if os.path.isabs(prompt_file)
                        else self.paths.home / prompt_file)
@@ -610,8 +624,9 @@ class Runner:
             sys.stderr.write("DRY-RUN loop=%s backend=%s cwd=%s prompt=%s\n"
                              % (loop_id, backend, cwd, prompt_path))
             sys.stderr.write("  command: %s\n"
-                             % self.backend.preview(backend, bin_preview, tools, cwd, add_dirs))
-            self.paths.runner_log_write("dry-run id=%s backend=%s" % (loop_id, backend))
+                             % self.backend.preview(backend, bin_preview, tools, cwd, add_dirs, model))
+            self.paths.runner_log_write(
+                "dry-run id=%s backend=%s model=%s" % (loop_id, backend, model or "-"))
             return
 
         if not (prompt_path.is_file() and os.access(prompt_path, os.R_OK)):
@@ -623,7 +638,7 @@ class Runner:
         prompt = prompt_path.read_text()
 
         self.paths.runner_log_write(
-            "run id=%s backend=%s cwd=%s" % (loop_id, backend, cwd))
+            "run id=%s backend=%s model=%s cwd=%s" % (loop_id, backend, model or "-", cwd))
 
         timeout_s = os.environ.get("CLAUDECRON_RUN_TIMEOUT_S")
         if timeout_s is None or timeout_s == "":
@@ -639,7 +654,7 @@ class Runner:
             log_fh.write("%s ----- run start id=%s backend=%s -----\n"
                          % (now_iso(), loop_id, backend))
             log_fh.flush()
-            rc = self.backend.exec(backend, prompt, tools, cwd, add_dirs, log_fh, timeout_s)
+            rc = self.backend.exec(backend, prompt, tools, cwd, add_dirs, log_fh, timeout_s, model)
             log_fh.write("%s ----- run end id=%s rc=%s dur=%ss -----\n"
                          % (now_iso(), loop_id, rc, epoch_now() - start))
             if rc == 124:
@@ -1132,7 +1147,7 @@ def cmd_add(args, ctx):
                  prompt_content if prompt_content.endswith("\n") else prompt_content + "\n")
     log_stderr("wrote prompt: %s" % (paths.home / prompt_rel))
     enabled = False if args.disabled else True
-    registry.upsert({
+    entry = {
         "id": loop_id,
         "enabled": enabled,
         "interval_minutes": interval,
@@ -1141,9 +1156,16 @@ def cmd_add(args, ctx):
         "allowed_tools": tools,
         "prompt_file": prompt_rel,
         "backend": backend,
-    })
-    log_stderr("added loop '%s' (interval %dm, backend %s, enabled=%s)"
-               % (loop_id, interval, backend, str(enabled).lower()))
+    }
+    # Only pin a per-loop model when one is given; otherwise the loop follows
+    # config default_model. An explicit --model "" means "omit --model" (CLI
+    # default) and is stored as such to override the config default.
+    if args.model is not None:
+        entry["model"] = args.model
+    registry.upsert(entry)
+    log_stderr("added loop '%s' (interval %dm, backend %s, model %s, enabled=%s)"
+               % (loop_id, interval, backend, args.model if args.model is not None else "default",
+                  str(enabled).lower()))
     log_stderr("it will NOT run until the scheduler fires; test now with: claudecron run --now %s"
                % loop_id)
 
@@ -1408,6 +1430,7 @@ def build_parser():
     pa.add_argument("--add-dir", action="append", dest="add_dir")
     pa.add_argument("--tools")
     pa.add_argument("--backend")
+    pa.add_argument("--model")
     pa.add_argument("--prompt")
     pa.add_argument("--prompt-file")
     pa.add_argument("-", dest="stdin", action="store_true")
