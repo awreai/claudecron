@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+# Copyright (c) 2026 The claudecron authors
+#
+# claudecron-notify - the default on_failure_cmd helper.
+#
+# claudecron runs this (via `on_failure_cmd`) whenever a loop finishes with a
+# non-zero status. Its job is to make sure a failure is NOT lost, even when the
+# environment that failed the loop is the same one a richer notifier would need
+# (the common case: the agent backend hit a usage/quota limit, so every loop -
+# including any agent-backed notifier loop - fails at once).
+#
+# It does two things, both dependency-free:
+#   1. Append the failure to a queue file (failures.ndjson) so a richer
+#      notifier loop can later summarize and deliver it (e.g. to Slack) when the
+#      backend is healthy again.
+#   2. Fire an immediate LOCAL notification that needs no agent and no network:
+#      a macOS notification (osascript), a Linux desktop notification
+#      (notify-send), or, failing both, a line appended to a local alert log.
+#
+# Coalescing: a persistent condition (a quota outage, a wedged dependency) would
+# otherwise fire every wake. We suppress a repeat local notification for the
+# same (loop, rc) within a cooldown window, and instead bump a count. The queue
+# still records every occurrence for the audit trail; only the noisy local
+# popup is rate-limited.
+#
+# Environment provided by claudecron: CLAUDECRON_LOOP_ID, CLAUDECRON_BACKEND,
+# CLAUDECRON_RESULT, CLAUDECRON_RC, CLAUDECRON_DURATION_S, CLAUDECRON_LOOP_LOG,
+# CLAUDECRON_HOST, CLAUDECRON_LOG_TAIL. CLAUDECRON_HOME locates the data tree.
+
+import datetime
+import json
+import os
+import subprocess
+import sys
+
+COOLDOWN_SECONDS = 1800  # 30 min: suppress repeat local popups for same (loop,rc)
+
+
+def home():
+    h = os.environ.get("CLAUDECRON_HOME")
+    if h:
+        return h
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        return os.path.join(xdg, "claudecron")
+    return os.path.join(os.environ.get("HOME", "."), ".config", "claudecron")
+
+
+def now():
+    return datetime.datetime.now().astimezone()
+
+
+def append_queue(qpath, record):
+    with open(qpath, "a") as fh:
+        fh.write(json.dumps(record) + "\n")
+
+
+def load_dedup(path):
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_dedup(path, data):
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as fh:
+            json.dump(data, fh)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def local_notify(title, message, alert_log):
+    """Best-effort local notification, no network, no agent."""
+    # macOS
+    if sys.platform == "darwin":
+        try:
+            safe_msg = message.replace('"', "'")[:200]
+            safe_title = title.replace('"', "'")[:100]
+            subprocess.run(
+                ["osascript", "-e",
+                 'display notification "%s" with title "%s"' % (safe_msg, safe_title)],
+                stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+            return
+        except (OSError, subprocess.SubprocessError):
+            pass
+    # Linux desktop
+    else:
+        import shutil
+        if shutil.which("notify-send"):
+            try:
+                subprocess.run(["notify-send", title, message[:200]],
+                               stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+                return
+            except (OSError, subprocess.SubprocessError):
+                pass
+    # Fallback: append to a local alert log so nothing is silently lost.
+    try:
+        with open(alert_log, "a") as fh:
+            fh.write("%s %s: %s\n" % (now().isoformat(), title, message))
+    except OSError:
+        pass
+
+
+def main():
+    root = home()
+    qpath = os.path.join(root, "failures.ndjson")
+    dedup_path = os.path.join(root, ".notify-dedup.json")
+    alert_log = os.path.join(root, "logs", "alerts.log")
+
+    loop = os.environ.get("CLAUDECRON_LOOP_ID", "")
+    rc = os.environ.get("CLAUDECRON_RC", "")
+    host = os.environ.get("CLAUDECRON_HOST", "")
+    tail = os.environ.get("CLAUDECRON_LOG_TAIL", "")[-1200:]
+    ts = now().isoformat()
+
+    # 1. Always record to the queue (full audit trail).
+    try:
+        append_queue(qpath, {"ts": ts, "loop": loop, "rc": rc, "host": host, "tail": tail})
+    except OSError:
+        pass
+
+    # 2. Coalesce the LOCAL popup by (loop, rc) within the cooldown window.
+    key = "%s|%s" % (loop, rc)
+    dedup = load_dedup(dedup_path)
+    entry = dedup.get(key, {})
+    last_epoch = entry.get("last_epoch", 0)
+    count = entry.get("count", 0) + 1
+    epoch = int(now().timestamp())
+    suppressed = (epoch - last_epoch) < COOLDOWN_SECONDS and last_epoch > 0
+
+    # A short, human reason from the tail (last non-empty line).
+    reason = ""
+    for line in reversed(tail.splitlines()):
+        line = line.strip()
+        if line and not line.startswith("-----"):
+            reason = line
+            break
+
+    if not suppressed:
+        title = "claudecron: loop failed"
+        msg = "%s (rc %s)" % (loop, rc)
+        if reason:
+            msg += " - %s" % reason[:120]
+        if count > 1:
+            msg += " [x%d]" % count
+        local_notify(title, msg, alert_log)
+        dedup[key] = {"last_epoch": epoch, "count": 0}  # reset after a popup
+    else:
+        # Suppressed: keep counting so the next popup shows how many piled up.
+        dedup[key] = {"last_epoch": last_epoch, "count": count}
+
+    save_dedup(dedup_path, dedup)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        # A failure hook must never itself blow up the runner.
+        sys.exit(0)

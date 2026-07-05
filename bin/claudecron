@@ -1059,6 +1059,16 @@ def cmd_init(args, ctx):
             die("init: --backend must be 'claude' or 'codex' (got '%s')" % args.backend)
         config.set("backend", args.backend)
         log_stderr("backend set to %s" % args.backend)
+    # Wire the default failure notifier (claudecron-notify, shipped alongside
+    # this binary) unless the user has already set their own on_failure_cmd. It
+    # fires a local, backend-independent alert on any loop failure, so an outage
+    # that fails every loop - including an agent-quota exhaustion - is never
+    # fully silent. Only set it if the helper is actually present next to us.
+    if not config.get("on_failure_cmd", ""):
+        helper = Path(__file__).resolve().parent / "claudecron-notify"
+        if helper.exists():
+            config.set("on_failure_cmd", str(helper))
+            log_stderr("wired default failure notifier: %s" % helper)
     registry.ensure()
     if args.no_scheduler or os.environ.get("CLAUDECRON_INIT_SCHEDULER") == "0":
         log_stderr("skipping scheduler install")

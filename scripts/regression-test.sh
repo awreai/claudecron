@@ -305,6 +305,45 @@ test_run_timeout_kills_hung_backend() {
   cleanup_home
 }
 
+# ---------------------------------------------------------------------------
+# 8. the on_failure_cmd wired by init fires the claudecron-notify helper, which
+#    enqueues every failure and coalesces repeat local alerts by (loop, rc).
+# ---------------------------------------------------------------------------
+test_notify_helper_enqueues_and_coalesces() {
+  fresh_home
+  NOTIFY="$REPO/bin/claudecron-notify"
+  [ -x "$NOTIFY" ] || { t_fail 'claudecron-notify helper is present and executable'; cleanup_home; return; }
+  # Force the local-notify fallback (no popup subprocess) by masking the
+  # notifier tools: point HOME at the temp tree; on CI there is no osascript/
+  # notify-send, so it appends to logs/alerts.log - which we assert on.
+  mkdir -p "$CLAUDECRON_HOME/logs"
+
+  # Two identical failures + one distinct rc.
+  CLAUDECRON_LOOP_ID=nx CLAUDECRON_RC=1 CLAUDECRON_HOST="$HOST" \
+    CLAUDECRON_LOG_TAIL=$'boot\nerror: alpha' python3 "$NOTIFY"
+  CLAUDECRON_LOOP_ID=nx CLAUDECRON_RC=1 CLAUDECRON_HOST="$HOST" \
+    CLAUDECRON_LOG_TAIL=$'error: alpha again' python3 "$NOTIFY"
+  CLAUDECRON_LOOP_ID=nx CLAUDECRON_RC=9 CLAUDECRON_HOST="$HOST" \
+    CLAUDECRON_LOG_TAIL=$'error: beta' python3 "$NOTIFY"
+
+  qlines="$(wc -l < "$CLAUDECRON_HOME/failures.ndjson" 2>/dev/null | tr -d ' ')"
+  if [ "$qlines" = "3" ]; then
+    t_ok 'notify helper enqueues every failure (audit trail)'
+  else
+    t_fail "notify helper enqueues every failure (got ${qlines:-0}, want 3)"
+  fi
+
+  # The dedup file should show the repeated (nx,1) key suppressed once (count=1).
+  cnt="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("nx|1",{}).get("count",0))' \
+    "$CLAUDECRON_HOME/.notify-dedup.json" 2>/dev/null)"
+  if [ "$cnt" = "1" ]; then
+    t_ok 'notify helper coalesces a repeat (loop,rc) within the cooldown'
+  else
+    t_fail "notify helper coalesces a repeat (loop,rc) (suppressed count=${cnt:-none}, want 1)"
+  fi
+  cleanup_home
+}
+
 test_disabled_loop_is_skipped
 test_stdin_reader_does_not_starve_pass
 test_live_lock_never_stolen
@@ -312,6 +351,7 @@ test_lock_freed_on_holder_death
 test_failure_hook_fires
 test_missed_windows_coalesce
 test_run_timeout_kills_hung_backend
+test_notify_helper_enqueues_and_coalesces
 
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
