@@ -126,16 +126,7 @@ def main():
     except OSError:
         pass
 
-    # 2. Coalesce the LOCAL popup by (loop, rc) within the cooldown window.
-    key = "%s|%s" % (loop, rc)
-    dedup = load_dedup(dedup_path)
-    entry = dedup.get(key, {})
-    last_epoch = entry.get("last_epoch", 0)
-    count = entry.get("count", 0) + 1
-    epoch = int(now().timestamp())
-    suppressed = (epoch - last_epoch) < COOLDOWN_SECONDS and last_epoch > 0
-
-    # A short, human reason from the tail (last non-empty line).
+    # A short, human reason from the tail (last non-empty, non-banner line).
     reason = ""
     for line in reversed(tail.splitlines()):
         line = line.strip()
@@ -143,13 +134,33 @@ def main():
             reason = line
             break
 
+    # 2. Classify the cause. SYSTEMIC conditions hit every loop at once and are
+    #    not per-loop bugs, so they coalesce to ONE shared key (one popup covers
+    #    the whole fleet). Everything else keys on (loop, rc).
+    systemic = _systemic_signature(reason)
+    if systemic:
+        key = "systemic|%s" % systemic
+    else:
+        key = "%s|%s" % (loop, rc)
+
+    dedup = load_dedup(dedup_path)
+    entry = dedup.get(key, {})
+    last_epoch = entry.get("last_epoch", 0)
+    count = entry.get("count", 0) + 1
+    epoch = int(now().timestamp())
+    suppressed = (epoch - last_epoch) < COOLDOWN_SECONDS and last_epoch > 0
+
     if not suppressed:
-        title = "claudecron: loop failed"
-        msg = "%s (rc %s)" % (loop, rc)
-        if reason:
-            msg += " - %s" % reason[:120]
+        if systemic:
+            title = "claudecron: %s" % systemic
+            msg = "loop failures from %s (latest: %s)" % (systemic, loop)
+        else:
+            title = "claudecron: loop failed"
+            msg = "%s (rc %s)" % (loop, rc)
+            if reason:
+                msg += " - %s" % reason[:120]
         if count > 1:
-            msg += " [x%d]" % count
+            msg += " [x%d since last alert]" % count
         local_notify(title, msg, alert_log)
         dedup[key] = {"last_epoch": epoch, "count": 0}  # reset after a popup
     else:
@@ -157,6 +168,26 @@ def main():
         dedup[key] = {"last_epoch": last_epoch, "count": count}
 
     save_dedup(dedup_path, dedup)
+
+
+# Systemic-cause signatures: conditions that fail every loop at once and are not
+# per-loop bugs. Returns a short label, or "" if the failure looks loop-specific.
+_SYSTEMIC_PATTERNS = [
+    ("agent quota", ("usage limit", "reached your", "fable 5 limit",
+                     "rate limit", "usage-credits", "out of credit", "quota")),
+    ("agent auth", ("please run /login", "not logged in", "authentication",
+                    "invalid api key", "unauthorized")),
+    ("network", ("could not resolve", "connection refused", "network is unreachable",
+                 "temporary failure in name resolution", "dns")),
+]
+
+
+def _systemic_signature(reason):
+    low = (reason or "").lower()
+    for label, needles in _SYSTEMIC_PATTERNS:
+        if any(n in low for n in needles):
+            return label
+    return ""
 
 
 if __name__ == "__main__":

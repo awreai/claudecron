@@ -344,6 +344,42 @@ test_notify_helper_enqueues_and_coalesces() {
   cleanup_home
 }
 
+# ---------------------------------------------------------------------------
+# 9. a systemic backend condition (quota/auth/network) that fails many loops at
+#    once coalesces to ONE shared local alert, while a genuine per-loop bug
+#    still gets its own. Everything is still recorded in the queue.
+# ---------------------------------------------------------------------------
+test_notify_helper_systemic_coalesce() {
+  fresh_home
+  NOTIFY="$REPO/bin/claudecron-notify"
+  [ -x "$NOTIFY" ] || { t_fail 'claudecron-notify helper is present'; cleanup_home; return; }
+  mkdir -p "$CLAUDECRON_HOME/logs"
+
+  # Three different loops all hit an agent quota limit.
+  for lp in loop-a loop-b loop-c; do
+    CLAUDECRON_LOOP_ID=$lp CLAUDECRON_RC=1 CLAUDECRON_HOST="$HOST" \
+      CLAUDECRON_LOG_TAIL="You have reached your Fable 5 limit. Run /usage-credits." python3 "$NOTIFY"
+  done
+  # A genuine per-loop bug.
+  CLAUDECRON_LOOP_ID=loop-d CLAUDECRON_RC=2 CLAUDECRON_HOST="$HOST" \
+    CLAUDECRON_LOG_TAIL="TypeError: object is not subscriptable" python3 "$NOTIFY"
+
+  keys="$(python3 -c 'import json,sys; print(",".join(sorted(json.load(open(sys.argv[1])).keys())))' \
+    "$CLAUDECRON_HOME/.notify-dedup.json" 2>/dev/null)"
+  if [ "$keys" = "loop-d|2,systemic|agent quota" ]; then
+    t_ok 'systemic failures share one alert key; a real bug keeps its own'
+  else
+    t_fail "systemic failures share one alert key (got keys: ${keys:-none})"
+  fi
+  qlines="$(wc -l < "$CLAUDECRON_HOME/failures.ndjson" 2>/dev/null | tr -d ' ')"
+  if [ "$qlines" = "4" ]; then
+    t_ok 'all failures still recorded in the queue during a systemic outage'
+  else
+    t_fail "all failures still recorded (got ${qlines:-0}, want 4)"
+  fi
+  cleanup_home
+}
+
 test_disabled_loop_is_skipped
 test_stdin_reader_does_not_starve_pass
 test_live_lock_never_stolen
@@ -352,6 +388,7 @@ test_failure_hook_fires
 test_missed_windows_coalesce
 test_run_timeout_kills_hung_backend
 test_notify_helper_enqueues_and_coalesces
+test_notify_helper_systemic_coalesce
 
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
