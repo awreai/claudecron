@@ -1,13 +1,35 @@
 # claudecron
 
-**Cron for headless AI coding agents.** Tell Claude Code or Codex to do a job on a schedule - "triage my PRs every 15 minutes", "summarize the error log every hour" - and it just happens, locally, on your machine. No server, no inbound surface, no cloud middleman.
+**Cron for headless AI coding agents.** Tell Claude Code or Codex to do a job on a schedule - "triage my PRs every 15 minutes", "summarize the error log every hour" - and it just happens, locally, on your machine, indefinitely. No server, no inbound surface, no cloud middleman, no session left open.
 
 `claudecron` is a tiny, auditable supervisor that sits between your OS scheduler and a headless agent (`claude` or `codex`). You describe the work in plain English to your agent; `claudecron` runs it on a cadence and reports back only when it matters.
 
 - **Talk to your agent, not a config file.** The installer wires skills into Claude Code and Codex. You say what you want; the skill writes the loop and registers it. (There is a full CLI underneath if you prefer - see below.)
 - **Local-first and least-privilege.** Every loop declares exactly which tools the agent may use and which directories it may touch. Nothing runs that you did not approve.
 - **Survives sleep.** If your laptop was asleep when a loop was due, `claudecron` runs it once on wake and moves on. One catch-up run, not a storm of missed ticks.
-- **Pure bash + jq.** No runtime, no daemon, MIT licensed. You only pay your own agent usage.
+- **One small file, zero dependencies.** A single self-contained Python 3 script - no daemon, no packages to install, MIT licensed. You only pay your own agent usage.
+
+---
+
+## Do you even need this? (honest comparison)
+
+Claude Code now ships its own scheduling, and for a lot of jobs that is the right answer. Reach for the built-ins first:
+
+| You want to... | Use |
+|---|---|
+| Poll something for a while *during a session* (a deploy, a PR) | Claude Code [`/loop`](https://code.claude.com/docs/en/scheduled-tasks) |
+| A durable local schedule, Claude backend, no terminal open | Claude Code [Desktop scheduled tasks](https://code.claude.com/docs/en/desktop-scheduled-tasks) |
+| A managed schedule that runs even with your machine off | Claude Code [Routines](https://code.claude.com/docs/en/routines) (cloud) |
+
+`claudecron` exists for the cases those do not cover:
+
+- **Codex too, not just Claude.** The built-ins are Claude-only. `claudecron` runs `claude` *or* `codex` behind the same registry, chosen per loop.
+- **Local, unattended, and unbounded.** `/loop` is session-scoped, has **no catch-up for missed fires**, and expires after 7 days. `claudecron` runs from your OS scheduler with no session, catches up once on wake, and never expires.
+- **Sub-hour cadence with nothing in the cloud.** Cloud Routines have a **1-hour minimum** and run in a fresh clone with no access to your local files. `claudecron` goes down to 1-minute intervals, entirely on your machine, against your real working tree.
+- **Per-loop least privilege as a first-class field.** Each loop pins its own `allowed_tools` and `add_dirs`. There is no implicit "all tools" mode.
+- **Plain files you own.** Registry, prompts, config, state, and logs are all diffable text under your home directory. One registry can drive several machines, each with its own cursor.
+
+If none of those matter to you, use the built-ins. If several do, that is the gap this fills.
 
 ---
 
@@ -18,6 +40,8 @@
 ```sh
 curl -fsSL https://raw.githubusercontent.com/awreai/claudecron/main/install.sh | sh
 ```
+
+The only requirement is `python3` (macOS and mainstream Linux both ship it).
 
 **2. Open Claude Code (or Codex) and just say what you want:**
 
@@ -65,14 +89,14 @@ The CLI is the contract; the skills only call into it. Delete every skill and `c
              v
   +---------------------+        reads
   |     claudecron      | -----------------------+
-  |   (runner, bash)    |                        |
-  +----------+----------+                        v
-             |                        +---------------------+
-             | for each DUE loop      |   registry.json     |
-             |                        |   { "loops": [...] } |
-             |                        +----------+----------+
-             |                                   |
-             |   per-loop prompt  <--------------+  prompts/<id>.md
+  |  (single Python 3   |                        |
+  |   file, stdlib only)|                        v
+  +----------+----------+            +---------------------+
+             |                       |   registry.json     |
+             | for each DUE loop     |   { "loops": [...] } |
+             |                       +----------+----------+
+             |                                  |
+             |   per-loop prompt  <-------------+  prompts/<id>.md
              v
   +---------------------+
   |   backend           |   claude  -p ... --allowedTools ... --add-dir ...
@@ -86,7 +110,7 @@ The CLI is the contract; the skills only call into it. Delete every skill and `c
   +---------------------+
 ```
 
-The runner takes a single mutex via `mkdir` so two wakes can never overlap. Each loop has its own log; the runner has its own log; state is written per host so one registry can drive several machines independently.
+The runner takes a lock so two wakes can never overlap, and each due loop runs under its own per-loop lock so a slow loop never blocks the others. Each loop has its own log; the runner has its own log; state is written per host so one registry can drive several machines independently.
 
 ### Catch-up on wake (the sleep story)
 
@@ -98,16 +122,42 @@ So: laptop sleeps for six hours, wakes, your 15-minute loop runs exactly once, a
 
 ## Backends
 
-`claudecron` shells out to a headless agent. You pick the backend per install (in `config.json`) and `claudecron` builds the exact invocation:
+`claudecron` shells out to a headless agent. You pick the backend per install (in `config.json`) or per loop, and `claudecron` builds the exact invocation:
 
 | Backend  | Invocation (conceptual)                                                                   | Sandbox / approvals               |
 |----------|-------------------------------------------------------------------------------------------|-----------------------------------|
-| `claude` | `claude -p "<prompt>" --allowedTools "<tools>" --add-dir "<cwd>" [--add-dir <dir>]... --output-format text` | Tools gated by `allowed_tools`; dirs gated by `add_dirs` |
+| `claude` | `claude -p "<prompt>" --allowedTools "<tools>" --add-dir "<cwd>" [--add-dir <dir>]... [--model <m>] --output-format text` | Tools gated by `allowed_tools`; dirs gated by `add_dirs` |
 | `codex`  | `codex exec "<prompt>" --cd "<cwd>" --sandbox workspace-write --ask-for-approval never`     | Workspace-write sandbox, no interactive approval |
 
 The backend binary is auto-detected, or you can pin it with `claude_bin` / `codex_bin` in `config.json`.
 
+**Model selection (claude).** A loop's own `model` field wins, then config `default_model`, then a built-in default. Pin one per loop with `claudecron add <id> --model <name>`; an explicit empty model omits `--model` and lets the CLI choose. `codex` ignores the model field.
+
 **Test seam.** Set `CLAUDECRON_TEST_BACKEND_CMD` and `claudecron` runs that command instead of a real backend. This lets you smoke-test scheduling, locking, state, and logging end to end without spending a single token. CI uses exactly this.
+
+---
+
+## Notifications and failures
+
+Loops notify you through their own granted tools - give a loop a Slack or webhook tool and write "post a summary to #ops" into its prompt, and only that loop can reach that channel.
+
+Separately, `claudecron` ships a **failure notifier** so a broken loop is never silent. On `init` it wires `claudecron-notify` as the default `on_failure_cmd`: any non-zero loop run fires a local, backend-independent alert (macOS notification, `notify-send` on Linux, or a log fallback). It coalesces noise - a repeated failure of the same loop is suppressed within a cooldown, and a systemic outage that fails *every* loop at once (an auth or quota problem, say) collapses into a single alert instead of one per loop. Point `on_failure_cmd` at your own script to route failures anywhere.
+
+---
+
+## Self-improving loops (opt-in)
+
+`init` seeds a built-in `self-improve` loop, **disabled by default**. When you enable it (`claudecron enable self-improve`), every couple of days it audits your *other* loops' prompts and run logs and rewrites prompts that have drifted - a loop that acts on quiet ticks, one that keeps erroring, one that lost its cold-start guard. Every rewrite is backed up first and must pass a validation gate before it is applied through the normal CLI path; it never hand-edits the registry.
+
+You can also run one pass on demand without enabling anything scheduled:
+
+```sh
+claudecron improve                      # audit + improve all loops, once
+claudecron improve --id pr-babysitter   # focus the audit on one loop
+claudecron improve --dry-run            # show what would run, invoke nothing
+```
+
+It is off by default on purpose: an agent that edits its own configuration should be something you turn on deliberately, not a surprise on a fresh install.
 
 ---
 
@@ -119,9 +169,9 @@ Program (libexec):
 
 ```
 ~/.local/share/claudecron/
-  bin/         the claudecron entrypoint and runner
-  lib/         bash helpers
-  templates/   scheduler unit/plist templates
+  bin/         the claudecron entrypoint (a single Python file) + claudecron-notify
+  skills/      agent skills wired into Claude Code / Codex
+  builtins/    shipped loop prompts (e.g. self-improve)
 ```
 
 Your data (`CLAUDECRON_HOME`), resolved in this order:
@@ -135,7 +185,7 @@ Your data (`CLAUDECRON_HOME`), resolved in this order:
   state/<hostname>/<id>.json  per-host run state and cursor
   logs/runner.log            the runner's own log
   logs/<id>.log              per-loop output
-  lock/                      mkdir mutex
+  lock/                      run lock
 ```
 
 ### Registry entry
@@ -155,15 +205,19 @@ Each loop in `registry.json` looks like this:
 }
 ```
 
+An optional `"model"` field pins the claude model for that loop.
+
 ### Global config
 
 ```json
 {
   "backend": "claude",
+  "default_model": "",
   "lock_stale_minutes": 30,
   "log_keep_lines": 500,
   "claude_bin": "",
-  "codex_bin": ""
+  "codex_bin": "",
+  "on_failure_cmd": ""
 }
 ```
 
@@ -261,7 +315,10 @@ Piping an installer to a shell deserves caution. So:
 Nothing to `claudecron` itself - it is local and free. You pay for your own agent usage (your `claude` or `codex` account/credits) exactly as if you had run the agent by hand. `claudecron` just decides *when*.
 
 **Does it need a server?**
-No. There is no backend service, no account, no hosted control plane. It is a bash program your OS scheduler runs locally.
+No. There is no backend service, no account, no hosted control plane. It is a single Python script your OS scheduler runs locally.
+
+**Do I need to keep a terminal or Claude Code session open?**
+No. Unlike a session-scoped `/loop`, `claudecron` runs from your OS scheduler with nothing open, and its loops do not expire.
 
 **How do I stop a loop?**
 Disable it (`claudecron disable <id>`, or set `"enabled": false` in the registry) to keep the definition but stop running it. To stop everything, `claudecron scheduler uninstall`. To remove the program entirely, delete `~/.local/share/claudecron` and, if you want, your `CLAUDECRON_HOME`.
@@ -272,29 +329,14 @@ No - nothing runs while the machine is asleep. On wake, any loop that became due
 **Can one registry drive several machines?**
 Yes. State is stored per host (`state/<hostname>/<id>.json`), so each machine keeps its own cursor while sharing the same registry and prompts.
 
-**Which shells/OSes are supported?**
-Pure bash that runs under macOS `/bin/bash` 3.2 and modern Linux bash. macOS (launchd) and Linux (systemd user timers) are supported for scheduling.
-
----
-
-## How it compares
-
-| | Raw cron | Cloud agent scheduler | **claudecron** |
-|---|---|---|---|
-| Where it runs | Your machine | Someone else's servers | Your machine |
-| Inbound network surface | None | Yes (hosted) | None |
-| Catch-up after sleep | No (missed ticks lost) | N/A (always on) | One run on wake, cursor covers gap |
-| Per-job tool/dir scoping | You hand-roll it | Vendor-defined | Built in (`allowed_tools`, `add_dirs`) |
-| Prompts & state | You manage ad hoc | Vendor-stored | Plain files you own, diffable |
-| Who pays for agent usage | You | You + platform fee | You (your own agent account) |
-| Multi-machine, one definition | Per-host crontabs | Account-wide | One registry, per-host cursors |
-| Auditable | Crontab only | Limited | Fully (registry/config/prompts/logs) |
+**Which OSes are supported?**
+macOS (launchd) and Linux (systemd user timers) for scheduling. The runner itself is a single Python 3 script (>= 3.6) and needs no other dependencies.
 
 ---
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). The headline rules: pure bash that runs under macOS bash 3.2 (no `mapfile`/`readarray`, no `flock`, no associative arrays), the CLI stays standalone, and run the scrub-check plus the token-free smoke test before you push.
+See [CONTRIBUTING.md](CONTRIBUTING.md). The headline rules: the runner stays a single stdlib-only Python file, the CLI stays standalone, and you run the scrub-check plus the token-free smoke and regression tests before you push.
 
 ## License
 

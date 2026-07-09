@@ -1,6 +1,6 @@
 # Contributing to claudecron
 
-Thanks for helping. `claudecron` is a small, auditable bash program with a few hard invariants. Most of this document is those invariants - break one and the build will (rightly) reject the change.
+Thanks for helping. `claudecron` is a small, auditable program with a few hard invariants. Most of this document is those invariants - break one and the build will (rightly) reject the change.
 
 ## Ground rules
 
@@ -9,18 +9,17 @@ Thanks for helping. `claudecron` is a small, auditable bash program with a few h
 - No emoticons anywhere in code or logs.
 - Use a single hyphen in prose. Never an en-dash or em-dash.
 
-## Portability: bash 3.2, no exceptions
+## Portability: one stdlib-only Python file, no dependencies
 
-Everything must run under macOS `/bin/bash` (version 3.2) as well as modern Linux bash. macOS ships 3.2 and that is the floor. This rules out a number of conveniences you may reach for by habit:
+The runner is a single Python 3 file at `bin/claudecron`. Keep it that way:
 
-- **No `mapfile` / `readarray`.** They do not exist in 3.2. Read into arrays with a `while read` loop instead.
-- **No `flock`.** It is not portable (and not on macOS). Use a `mkdir`-based mutex - `mkdir` is atomic, and a failed `mkdir` means the lock is held.
-- **No associative arrays (`declare -A`).** Not supported in 3.2. Use indexed arrays, or parallel arrays, or parse JSON on demand.
-- **Guard every array expansion under `set -u`.** A bare `"${arr[@]}"` on an empty array errors under `set -u` in bash 3.2. Always write `${arr[@]+"${arr[@]}"}`.
-- **Detect the `date` flavor.** BSD `date` (macOS) uses `date -j`; GNU `date` (Linux) uses `date -d`. Branch on which one is present; never assume one.
-- **No GNU-only flags** on `sed`, `grep`, `stat`, etc. If you need `stat`, branch BSD vs GNU. Prefer POSIX-portable invocations.
+- **Standard library only.** No third-party packages, no `pip install`, no virtualenv. The whole point is that `python3` (which macOS and mainstream Linux both ship) is the only requirement. If you reach for a dependency, you have taken a wrong turn.
+- **Python 3.6+.** That is the floor. Avoid features newer than 3.6 (for example, do not rely on `str.removeprefix`, which is 3.9). When in doubt, test under an older interpreter.
+- **One file.** Do not split the runner into a package. The single-file property is what makes it trivial to read, audit, vendor, and ship in a tarball. Helper scripts under `scripts/` and the `claudecron-notify` helper are the only other executables.
+- **Cross-platform by branching, not assuming.** macOS (launchd) and Linux (systemd user timers) are both supported. Detect the platform and branch; never hardcode one scheduler's paths or `date` flavor.
+- **The `install.sh` and uninstall scripts stay POSIX `sh`.** They must run before Python is even confirmed present (they check for it), so keep them dependency-free shell.
 
-If you are unsure whether something is 3.2-safe, test it under `/bin/bash` on a Mac before sending the change.
+If you are unsure whether something works on an older Python, test it before sending the change.
 
 ## Invariant: the CLI stays standalone
 
@@ -51,12 +50,14 @@ If `CLAUDECRON_TEST_BACKEND_CMD` is set, run **that** command instead of a real 
 Run both of these locally. CI runs them too, but catching it yourself is faster:
 
 ```sh
-make scrub-check    # or: ./scripts/scrub-check.sh
-make smoke-test     # or: ./scripts/smoke-test.sh
+./scripts/scrub-check.sh
+./scripts/smoke-test.sh
+./scripts/regression-test.sh
 ```
 
-- **scrub-check** - greps the tree for anything that must never ship: personal names, internal hostnames, real Slack/Discord IDs, absolute paths from a developer machine, vendor-internal labels. Examples in docs must use only the generic placeholders: repo `octocat/hello-world`, user `octocat`, email `you@example.com`, channel `<CHANNEL_ID>`. The scheduler basename must be `dev.claudecron.runner` and nothing else. If scrub-check fails, fix the leak; do not weaken the check.
-- **smoke-test** - runs a full add -> run --now -> run --wake -> status cycle against `CLAUDECRON_TEST_BACKEND_CMD`, asserting on lock behavior, cursor advancement, and per-host state. Token-free by construction. If you touched scheduling, locking, state, or logging, the smoke test is the proof it still works.
+- **scrub-check** - scans the tree for anything that must never ship: personal names, internal hostnames, real Slack/Discord IDs, absolute paths from a developer machine, vendor-internal labels. Examples in docs must use only the generic placeholders: repo `octocat/hello-world`, user `octocat`, email `you@example.com`, channel `<CHANNEL_ID>`. The scheduler basename must be `dev.claudecron.runner` and nothing else. If scrub-check fails, fix the leak; do not weaken the check. Note: it scans the working tree only, not git history - keep commit author identities clean at commit time.
+- **smoke-test** - runs a full init -> add -> run --now cycle against `CLAUDECRON_TEST_BACKEND_CMD`, asserting on lock behavior, cursor advancement, and per-host state. Token-free by construction.
+- **regression-test** - the behavioral suite: disabled-loop skipping, stdin isolation, lock stealing/liveness, the failure hook and notifier coalescing, timeout kills, model resolution, and self-improve seeding. If you touched scheduling, locking, state, notifications, or the runner, this is the proof it still works.
 
 ## Pull requests
 
@@ -69,7 +70,7 @@ make smoke-test     # or: ./scripts/smoke-test.sh
 
 Releases are tagged tarballs with a published checksum, consumed by the `curl | sh` installer and the Homebrew tap.
 
-1. **Bump the version.** Update `CLAUDECRON_VERSION` and the `CHANGELOG.md` Unreleased section: move entries under a new dated version heading.
+1. **Bump the version.** Update the `VERSION` file (and the pinned `DEFAULT_VERSION` in `install.sh` / the Homebrew formula) and the `CHANGELOG.md` Unreleased section: move entries under a new dated version heading.
 2. **Tag.** Create an annotated git tag for the version (for example `v0.1.0`) and push it.
 3. **Build the tarball + checksum.** Produce the release tarball and a `sha256` checksum file beside it. The checksum is what the installer verifies, so it must match the published artifact exactly.
 4. **Cut the Release.** Publish a GitHub Release for the tag, attaching the tarball and its `.sha256`. Paste the relevant CHANGELOG section as the release notes.

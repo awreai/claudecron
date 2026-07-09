@@ -5,7 +5,7 @@ description: >-
   Codex backend. Use when the user says "run X every N minutes", "schedule this
   agent", "set up a loop", "keep checking X on an interval", or asks how a loop
   is doing / wants to stop or delete one, and the working agent is Codex. The
-  claudecron CLI is fully standalone (pure bash, no runtime deps) and owns a
+  claudecron CLI is a single self-contained Python 3 file (stdlib only) and owns a
   local registry, prompts, per-host state, logs, and a launchd/systemd timer.
 ---
 
@@ -29,9 +29,9 @@ and is owned exclusively by the CLI. **Never** write, edit, or hand-merge
 delete goes through a `claudecron` subcommand. Hand-editing JSON desyncs state,
 corrupts the registry, and races the runner.
 
-The CLI is standalone: pure bash that runs under macOS `/bin/bash` 3.2, no
-package manager, no network install. If `claudecron` is not on PATH, tell the
-user to install it; do not fabricate the registry.
+The CLI is standalone: a single stdlib-only Python 3 file, no package manager,
+no network install. If `claudecron` is not on PATH, tell the user to install it;
+do not fabricate the registry.
 
 ## Where things live
 
@@ -47,7 +47,7 @@ Resolution of `CLAUDECRON_HOME`, in order: `$CLAUDECRON_HOME` ->
 - Scheduler unit basename: `dev.claudecron.runner`
 
 Program code lives separately under `~/.local/share/claudecron/` (`bin/`,
-`lib/`, `templates/`). You do not edit that.
+`skills/`, `builtins/`). You do not edit that.
 
 ## Step 1 - gather intent
 
