@@ -1064,6 +1064,44 @@ def human_next_due(state, loop_id, interval):
     return "in %dm" % ((due - now + 59) // 60)
 
 
+SELF_IMPROVE_ID = "self-improve"
+SELF_IMPROVE_INTERVAL_MINUTES = 2880  # every 2 days
+
+
+def seed_self_improve(paths, registry):
+    """Register the built-in self-improve loop if it is not already present.
+
+    Idempotent: an existing entry (however the user has configured it) is left
+    untouched. The loop is seeded DISABLED - a self-editing agent is opt-in, not
+    something a fresh install should start running unprompted. The user enables
+    it with `claudecron enable self-improve`, or runs a one-off pass any time
+    with `claudecron improve`. The shipped builtin prompt is copied into the
+    data dir so upgrades can refresh it.
+    """
+    if registry.exists(SELF_IMPROVE_ID):
+        log_stderr("self-improve loop already present; leaving as is")
+        return
+    src = libexec_root() / "builtins" / "self-improve.prompt.md"
+    if not src.exists():
+        log_stderr("builtin self-improve prompt not found at %s; skipping seed" % src)
+        return
+    prompt_rel = "prompts/%s.md" % SELF_IMPROVE_ID
+    paths.prompts.mkdir(parents=True, exist_ok=True)
+    atomic_write(paths.home / prompt_rel, src.read_text())
+    registry.upsert({
+        "id": SELF_IMPROVE_ID,
+        "enabled": False,
+        "interval_minutes": SELF_IMPROVE_INTERVAL_MINUTES,
+        "cwd": os.environ.get("HOME", "/"),
+        "add_dirs": [],
+        "allowed_tools": "Bash,Read,Write",
+        "prompt_file": prompt_rel,
+        "backend": "claude",
+    })
+    log_stderr("seeded built-in self-improve loop (disabled; enable with "
+               "'claudecron enable %s')" % SELF_IMPROVE_ID)
+
+
 def cmd_init(args, ctx):
     paths, config, registry = ctx["paths"], ctx["config"], ctx["registry"]
     paths.mkdirs()
@@ -1085,6 +1123,7 @@ def cmd_init(args, ctx):
             config.set("on_failure_cmd", str(helper))
             log_stderr("wired default failure notifier: %s" % helper)
     registry.ensure()
+    seed_self_improve(paths, registry)
     if args.no_scheduler or os.environ.get("CLAUDECRON_INIT_SCHEDULER") == "0":
         log_stderr("skipping scheduler install")
     else:
@@ -1116,17 +1155,41 @@ def cmd_add(args, ctx):
         die("add: interactive mode needs a TTY; pass --interval/--cwd/--tools/--prompt(-file)")
     if sources > 1:
         die("add: choose only one of --prompt, --prompt-file, or - (stdin)")
-    interval = parse_interval(args.interval or DEFAULT_INTERVAL_MINUTES)
-    cwd = args.cwd or os.getcwd()
-    if not args.cwd:
+
+    # Re-add preserves fields the caller did not restate. When overwriting an
+    # existing loop (--force) each field falls back to the existing value, not
+    # the global default, so a prompt-only re-add keeps interval/cwd/tools/etc.
+    # This is what makes `claudecron add <id> --prompt-file X` a safe in-place
+    # prompt update - the path the self-improve loop uses to rewrite prompts.
+    existing = registry.get(loop_id) or {}
+
+    if args.interval:
+        interval = parse_interval(args.interval)
+    elif existing:
+        interval = parse_interval(existing.get("interval_minutes", DEFAULT_INTERVAL_MINUTES))
+    else:
+        interval = parse_interval(DEFAULT_INTERVAL_MINUTES)
+
+    if args.cwd:
+        cwd = args.cwd
+    elif existing.get("cwd"):
+        cwd = existing["cwd"]
+    else:
+        cwd = os.getcwd()
         log_stderr("no --cwd given; defaulting to %s" % cwd)
     if not cwd.startswith("/"):
         die("add: --cwd must be an absolute path (got '%s')" % cwd)
-    for d in (args.add_dir or []):
+
+    if args.add_dir:
+        add_dirs = args.add_dir
+    else:
+        add_dirs = existing.get("add_dirs", []) if existing else []
+    for d in add_dirs:
         if not d.startswith("/"):
             die("add: --add-dir must be absolute (got '%s')" % d)
-    tools = args.tools or ADD_DEFAULT_ALLOWED_TOOLS
-    backend = args.backend or config.get("backend", "claude")
+
+    tools = args.tools or existing.get("allowed_tools") or ADD_DEFAULT_ALLOWED_TOOLS
+    backend = args.backend or existing.get("backend") or config.get("backend", "claude")
     if backend not in ("claude", "codex"):
         die("add: backend must be 'claude' or 'codex' (got '%s')" % backend)
     if args.prompt:
@@ -1146,22 +1209,34 @@ def cmd_add(args, ctx):
     atomic_write(paths.home / prompt_rel,
                  prompt_content if prompt_content.endswith("\n") else prompt_content + "\n")
     log_stderr("wrote prompt: %s" % (paths.home / prompt_rel))
-    enabled = False if args.disabled else True
+    # enabled: explicit flags win; otherwise preserve the existing value on
+    # re-add, and default to enabled for a brand-new loop.
+    if args.enabled:
+        enabled = True
+    elif args.disabled:
+        enabled = False
+    elif existing:
+        enabled = bool(existing.get("enabled", True))
+    else:
+        enabled = True
     entry = {
         "id": loop_id,
         "enabled": enabled,
         "interval_minutes": interval,
         "cwd": cwd,
-        "add_dirs": args.add_dir or [],
+        "add_dirs": add_dirs,
         "allowed_tools": tools,
         "prompt_file": prompt_rel,
         "backend": backend,
     }
     # Only pin a per-loop model when one is given; otherwise the loop follows
     # config default_model. An explicit --model "" means "omit --model" (CLI
-    # default) and is stored as such to override the config default.
+    # default) and is stored as such to override the config default. On re-add
+    # without --model, preserve any existing per-loop model pin.
     if args.model is not None:
         entry["model"] = args.model
+    elif existing and "model" in existing:
+        entry["model"] = existing["model"]
     registry.upsert(entry)
     log_stderr("added loop '%s' (interval %dm, backend %s, model %s, enabled=%s)"
                % (loop_id, interval, backend, args.model if args.model is not None else "default",
@@ -1227,6 +1302,26 @@ def cmd_run(args, ctx):
         return runner.run_pass(force=True, only_id=args.now, dry_run=args.dry_run)
     log_stderr("starting due pass on %s" % ctx["paths"].host)
     return runner.run_pass(wake=True, dry_run=args.dry_run)
+
+
+def cmd_improve(args, ctx):
+    """Run one self-improve pass now: audit loop prompts and improve them.
+
+    Same pass the scheduled self-improve loop runs, on demand. With --id, focus
+    the audit on a single loop (exported as CLAUDECRON_IMPROVE_FOCUS, which the
+    self-improve prompt reads). The self-improve loop is forced to run here even
+    if it is disabled - running it explicitly is the opt-in.
+    """
+    registry, runner = ctx["registry"], ctx["runner"]
+    if not registry.exists(SELF_IMPROVE_ID):
+        die("no self-improve loop; run 'claudecron init' to seed it")
+    if args.id:
+        validate_id(args.id)
+        if not registry.exists(args.id):
+            die("improve: no such loop '%s'" % args.id)
+        log_stderr("improve focus: %s" % args.id)
+        os.environ["CLAUDECRON_IMPROVE_FOCUS"] = args.id
+    return runner.run_pass(force=True, only_id=SELF_IMPROVE_ID, dry_run=args.dry_run)
 
 
 def cmd_logs(args, ctx):
@@ -1451,6 +1546,10 @@ def build_parser():
     pr.add_argument("--backend")
     pr.add_argument("--wake", action="store_true")
 
+    pv = sub.add_parser("improve")
+    pv.add_argument("--id")
+    pv.add_argument("--dry-run", action="store_true")
+
     for name in ("logs", "log"):
         pg = sub.add_parser(name)
         pg.add_argument("id", nargs="?")
@@ -1479,7 +1578,8 @@ def build_parser():
 
 DISPATCH = {
     "init": cmd_init, "add": cmd_add, "list": cmd_list, "ls": cmd_list,
-    "status": cmd_status, "st": cmd_status, "run": cmd_run, "logs": cmd_logs,
+    "status": cmd_status, "st": cmd_status, "run": cmd_run, "improve": cmd_improve,
+    "logs": cmd_logs,
     "log": cmd_logs, "enable": cmd_enable, "disable": cmd_disable,
     "remove": cmd_remove, "rm": cmd_remove, "doctor": cmd_doctor,
     "scheduler": cmd_scheduler, "skills": cmd_skills, "uninstall": cmd_uninstall,

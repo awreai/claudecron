@@ -139,7 +139,10 @@ EOS
   else
     t_fail 'all three loops ran despite a stdin-eating backend'
   fi
-  if grep -q 'wake done.*processed=3' "$CLAUDECRON_HOME/logs/runner.log" 2>/dev/null; then
+  # init seeds a disabled built-in self-improve loop, so the registry holds the
+  # three test loops plus self-improve. A wake pass counts every entry it walks
+  # (disabled ones are counted then skipped), so processed=4.
+  if grep -q 'wake done.*processed=4' "$CLAUDECRON_HOME/logs/runner.log" 2>/dev/null; then
     t_ok 'pass processed the whole registry'
   else
     t_fail 'pass processed the whole registry'
@@ -419,8 +422,79 @@ test_per_loop_model_resolution() {
   cleanup_home
 }
 
+# loop_field <registry-file> <loop-id> <field> - print one field of one loop,
+# or "" if the loop or field is absent. Keeps the test jq-free like jget.
+loop_field() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        loops = json.load(f).get("loops", [])
+    v = ""
+    for lp in loops:
+        if lp.get("id") == sys.argv[2]:
+            v = lp.get(sys.argv[3], "")
+            break
+except Exception:
+    v = ""
+print("" if v is None else v)
+PY
+}
+
+# loop_count <registry-file> <loop-id> - how many entries have this id.
+loop_count() {
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        loops = json.load(f).get("loops", [])
+    print(sum(1 for lp in loops if lp.get("id") == sys.argv[2]))
+except Exception:
+    print(0)
+PY
+}
+
+test_self_improve_seed_and_improve() {
+  fresh_home
+  local reg="$CLAUDECRON_HOME/registry.json"
+  # init (via fresh_home) seeds the built-in self-improve loop, DISABLED.
+  if [ "$(loop_field "$reg" self-improve enabled)" = "False" ]; then
+    t_ok 'init seeds self-improve loop disabled'
+  else
+    t_fail 'init seeds self-improve loop disabled'
+  fi
+
+  # Re-init is idempotent: still exactly one self-improve entry.
+  "$BIN" init --no-scheduler --no-skills >/dev/null 2>&1
+  if [ "$(loop_count "$reg" self-improve)" = "1" ]; then
+    t_ok 're-init does not duplicate the self-improve loop'
+  else
+    t_fail 're-init does not duplicate the self-improve loop'
+  fi
+
+  # `improve --dry-run` forces the self-improve loop even though it is disabled.
+  out="$("$BIN" improve --dry-run 2>&1)"
+  if printf '%s' "$out" | grep -q "loop=self-improve"; then
+    t_ok 'improve runs the self-improve loop on demand despite it being disabled'
+  else
+    t_fail 'improve runs the self-improve loop on demand despite it being disabled'
+  fi
+
+  # Re-add preserves untouched fields: change only the prompt, keep interval/tools.
+  "$BIN" add keeper --interval 45 --cwd "$TMP" --tools "Read,Grep" --prompt old >/dev/null 2>&1
+  "$BIN" add keeper --force --prompt new >/dev/null 2>&1
+  if [ "$(loop_field "$reg" keeper interval_minutes)" = "45" ] \
+     && [ "$(loop_field "$reg" keeper allowed_tools)" = "Read,Grep" ]; then
+    t_ok 're-add preserves interval and tools when only the prompt changes'
+  else
+    t_fail 're-add preserves interval and tools when only the prompt changes'
+  fi
+  cleanup_home
+}
+
 test_disabled_loop_is_skipped
 test_stdin_reader_does_not_starve_pass
+test_self_improve_seed_and_improve
 test_live_lock_never_stolen
 test_lock_freed_on_holder_death
 test_failure_hook_fires

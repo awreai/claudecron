@@ -17,9 +17,11 @@ class Claudecron < Formula
 
   def install
     # The runner is a single self-contained Python file under bin/. Ship the
-    # skills alongside it so `claudecron skills install` can wire the agents.
+    # skills alongside it so `claudecron skills install` can wire the agents,
+    # and the built-in loop prompts so `claudecron init` can seed them.
     libexec.install "bin"
     libexec.install "skills" if File.directory?("skills")
+    libexec.install "builtins" if File.directory?("builtins")
     (libexec/"VERSION").write("#{version}\n") unless (libexec/"VERSION").exist?
 
     chmod 0755, libexec/"bin/claudecron"

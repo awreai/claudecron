@@ -139,6 +139,9 @@ stage_tree() {
   # Ship the agent skills so 'claudecron skills install' can wire Claude Code
   # and Codex. Optional: absence is non-fatal (the CLI works standalone).
   [ -d "$_src/skills" ] && cp -R "$_src/skills" "$LIBEXEC/skills"
+  # Ship the built-in loop prompts (e.g. self-improve) so 'claudecron init' can
+  # seed them. Optional: absence just means those builtins are not seeded.
+  [ -d "$_src/builtins" ] && cp -R "$_src/builtins" "$LIBEXEC/builtins"
 
   if [ -f "$_src/VERSION" ]; then
     cp "$_src/VERSION" "$LIBEXEC/VERSION"
