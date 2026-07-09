@@ -40,7 +40,7 @@ if command -v rg >/dev/null 2>&1; then
 else
   SCAN() { grep -rInE -i \
             --exclude-dir=.git --exclude='*.lock' --exclude='*.min.*' --exclude-dir=dist \
-            --exclude="$SELF_NAME" \
+            --exclude='.git' --exclude="$SELF_NAME" \
             "$1" "$ROOT" 2>/dev/null \
             | sed -E "s#$ALLOW_RE#REPO_URL#gi" \
             | grep -iE "$1" 2>/dev/null; }

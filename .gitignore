@@ -16,5 +16,9 @@ lock/
 .worktrees/
 .DS_Store
 
+# Internal working docs (design specs, implementation plans) never ship publicly
+docs/design/
+docs/superpowers/
+
 __pycache__/
 *.pyc
