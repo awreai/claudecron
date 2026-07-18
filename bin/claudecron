@@ -809,6 +809,12 @@ class Scheduler:
             '    <key>PATH</key>\n    <string>%s</string>\n'
             '    <key>CLAUDECRON_HOME</key>\n    <string>%s</string>\n  </dict>\n'
             '  <key>StartInterval</key>\n  <integer>%d</integer>\n'
+            # Belt and braces: an empty StartCalendarInterval fires every minute on
+            # the wall clock. Observed in the wild (2026-07-19): a loaded job whose
+            # StartInterval timer silently stopped firing for days while kickstart
+            # and RunAtLoad still worked. Calendar triggers survive that failure
+            # mode; a wake that finds nothing due is a sub-second skip pass.
+            '  <key>StartCalendarInterval</key>\n  <dict/>\n'
             '  <key>RunAtLoad</key>\n  <true/>\n'
             '  <key>ProcessType</key>\n  <string>Background</string>\n'
             '  <key>LowPriorityIO</key>\n  <true/>\n'
