@@ -494,6 +494,54 @@ test_self_improve_seed_and_improve() {
 
 test_disabled_loop_is_skipped
 test_stdin_reader_does_not_starve_pass
+# ---------------------------------------------------------------------------
+# exec backend: the prompt is a shell command line, run via /bin/sh, no agent
+# ---------------------------------------------------------------------------
+test_exec_backend_runs_command() {
+  fresh_home
+  unset CLAUDECRON_TEST_BACKEND_CMD 2>/dev/null || true
+  "$BIN" add hb --interval 1 --cwd "$TMP" --backend exec \
+    --prompt "touch '$TMP/exec-ran'" >/dev/null 2>&1
+  "$BIN" run --now hb >/dev/null 2>&1 || true
+  if [ -f "$TMP/exec-ran" ]; then
+    t_ok 'exec backend runs the command line via /bin/sh'
+  else
+    t_fail 'exec backend runs the command line via /bin/sh'
+  fi
+  cleanup_home
+}
+
+# ---------------------------------------------------------------------------
+# --at daily anchor: stored, due once after the anchor, not due before it.
+# Uses 00:00 (always past today) and 23:59 (future except during that minute,
+# a one-minute-per-day flake window we accept).
+# ---------------------------------------------------------------------------
+test_at_daily_anchor() {
+  fresh_home
+  export CLAUDECRON_TEST_BACKEND_CMD="echo ran >> '$TMP/at-runs.log'"
+  "$BIN" add morning --at 00:00 --cwd "$TMP" --backend claude --prompt noop >/dev/null 2>&1
+  "$BIN" add evening --at 23:59 --cwd "$TMP" --backend claude --prompt noop >/dev/null 2>&1
+  if grep -q '00:00' "$CLAUDECRON_HOME/registry.json" 2>/dev/null; then
+    t_ok '--at anchor is stored in the registry'
+  else
+    t_fail '--at anchor is stored in the registry'
+  fi
+  "$BIN" run >/dev/null 2>&1 || true
+  "$BIN" run >/dev/null 2>&1 || true
+  runs=$(wc -l < "$TMP/at-runs.log" 2>/dev/null | tr -d ' ')
+  if [ "${runs:-0}" = "1" ]; then
+    t_ok 'past anchor runs exactly once; future anchor stays not-due'
+  else
+    t_fail "past anchor runs exactly once; future anchor stays not-due (runs=${runs:-0})"
+  fi
+  if grep -q 'skip id=evening reason=not-due.*at=23:59' "$CLAUDECRON_HOME/logs/runner.log" 2>/dev/null; then
+    t_ok 'anchored skip is logged with at=HH:MM'
+  else
+    t_fail 'anchored skip is logged with at=HH:MM'
+  fi
+  cleanup_home
+}
+
 test_self_improve_seed_and_improve
 test_live_lock_never_stolen
 test_lock_freed_on_holder_death
@@ -503,6 +551,8 @@ test_run_timeout_kills_hung_backend
 test_notify_helper_enqueues_and_coalesces
 test_notify_helper_systemic_coalesce
 test_per_loop_model_resolution
+test_exec_backend_runs_command
+test_at_daily_anchor
 
 printf '%s passed, %s failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

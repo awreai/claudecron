@@ -71,6 +71,8 @@ claudecron status                    # dashboard of every loop
 claudecron logs pr-babysitter -f     # follow a loop's output
 ```
 
+Two scheduling styles: `--interval 15m` (elapsed time since last run) or `--at 07:00` (daily anchor, 24h local time). An anchored loop runs once per day at or after its time; a missed day catches up with one run, same as intervals. `--at ""` on a re-add clears the anchor.
+
 The CLI is the contract; the skills only call into it. Delete every skill and `claudecron` keeps working identically.
 
 ---
@@ -128,6 +130,9 @@ So: laptop sleeps for six hours, wakes, your 15-minute loop runs exactly once, a
 |----------|-------------------------------------------------------------------------------------------|-----------------------------------|
 | `claude` | `claude -p "<prompt>" --allowedTools "<tools>" --add-dir "<cwd>" [--add-dir <dir>]... [--model <m>] --output-format text` | Tools gated by `allowed_tools`; dirs gated by `add_dirs` |
 | `codex`  | `codex exec "<prompt>" --cd "<cwd>" --sandbox workspace-write --ask-for-approval never`     | Workspace-write sandbox, no interactive approval |
+| `exec`   | `/bin/sh -c "<prompt>"` - the prompt IS the command line; no agent, no tokens               | Whatever the command itself does; `tools`/`model` ignored |
+
+The `exec` backend turns a loop into a plain scheduled command with claudecron's locking, state, logs, catch-up, and failure notifications. Use it for deterministic glue (pollers, heartbeats) sitting next to agent loops.
 
 The backend binary is auto-detected, or you can pin it with `claude_bin` / `codex_bin` in `config.json`.
 
